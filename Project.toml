@@ -1,0 +1,13 @@
+name = "BGZFLib"
+uuid = "b86bd9b6-aa64-492d-a0e2-e61a004d8aed"
+authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+LibDeflate = "9255714d-24a7-4b30-8ea3-d46a97f7e13b"
+MemoryViews = "a791c907-b98b-4e44-8f4d-e4c2362c6b2f"
+
+[compat]
+LibDeflate = "0.4.2"
+MemoryViews = "0.3.1"
+julia = "1.11"
