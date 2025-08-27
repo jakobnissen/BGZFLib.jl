@@ -2,29 +2,43 @@ module BGZFLib
 
 const DEBUG = true
 
-using MemoryViews: ImmutableMemoryView, MemoryView
+using MemoryViews: ImmutableMemoryView, MutableMemoryView, MemoryView
 using LibDeflate: ReadableMemory,
     Compressor,
     Decompressor,
     GzipExtraField,
     parse_gzip_header,
-    LibDeflateError
+    LibDeflateError,
+    LibDeflateErrors
 
-export VirtualOffset, BGZFReader, BGZFError, consume, getbuffer, fillbuffer
+using BufIO: BufIO
+
+export VirtualOffset, BGZFReader, BGZFError
 
 # BGZF blocks are no larger than 64 KiB before and after compression.
 const MAX_BLOCK_SIZE = UInt(64 * 1024)
 
-"""
-    BGZFError(message::String)
+# Blocks can be idle, running, done or error
+# Reader can be idle, error or closed
+const STATE_IDLE = 0x00
+const STATE_RUNNING = 0x01
+const STATE_DONE = 0x02
+const STATE_ERROR = 0x03
+const STATE_CLOSED = 0x04
 
-BGZF de/compressor errored with `message` when processing data."
-"""
+module BGZFErrors
+
+    @enum BGZFErrorType::UInt8 TruncatedFile MissingBCField TooLargeBlockSize
+
+    export BGZFErrorType
+
+end # module BGZFErrors
+
+using .BGZFErrors
+
 struct BGZFError <: Exception
-    message::String
+    type::Union{BGZFErrorType, LibDeflateError}
 end
-
-@noinline bgzferror(s::String) = throw(BGZFError(s))
 
 const BitInteger = Union{UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64}
 
@@ -41,13 +55,18 @@ end
 const DE_COMPRESSOR = Union{Compressor, Decompressor}
 
 include("block.jl")
+
+import .Blocks: Blocks, EOF_BLOCK
+
 include("virtualoffset.jl")
 
-mutable struct BGZFReader{I <: IO}
+mutable struct BGZFReader{I <: IO} <: BufIO.AbstractBufReader
     const io::I
-    const blocks::Memory{Blocks.Block{Decompressor}}
 
-    # We read from `io` in here
+    # This is not const, because we replace it with an empty memory once the reader is closed
+    blocks::Memory{Blocks.Block{Decompressor}}
+
+    # We read from `io` in here.
     const buffer::Memory{UInt8}
 
     const gzip_extra_fields::Vector{GzipExtraField}
@@ -73,18 +92,25 @@ mutable struct BGZFReader{I <: IO}
 
     check_truncated::Bool
 
+    state::UInt8
+
+    error::BGZFError
+
     # TODO: Add the number of consumed bytes to report position
     # position must be a virtual offset EXCLUSIVELY
+end
 
-    # TODO: Add an atomic field set when the reader errors, and check it in
-    # queue!? Maybe like open, corrupted, closed
+function error!(reader::BGZFReader, error::BGZFError)::Union{}
+    reader.state = STATE_ERROR
+    reader.error = error
+    throw(error)
 end
 
 next_block_index(r::BGZFReader, i::Int) = i ≥ length(r.blocks) ? 1 : i + 1
 
 function BGZFReader(
         io::IO;
-        threads::Int = threads.nthreads(),
+        threads::Int = Threads.nthreads(),
         check_truncated::Bool = true
     )
     threads < 1 && throw(ArgumentError("Must use at least one thread to read"))
@@ -104,19 +130,29 @@ function BGZFReader(
         1,
         0,
         1,
-        # Start at last block, since that emulates having just exhausted an
-        # empty block, then we start from 1.
-        length(blocks),
+        1,
         1,
         false,
         check_truncated,
+        STATE_IDLE,
+        BGZFError(BGZFErrors.TruncatedFile), # arbitrary value
     )
 end
 
 function Base.close(reader::BGZFReader)
-    # TODO: switch atomic state once we get that to closed
+    reader.state == STATE_CLOSED && return nothing
+    reader.state = STATE_CLOSED
+    reader.blocks = Memory{Blocks.Block{Decompressor}}()
     return close(reader.io)
 end
+
+function Base.eof(x::BGZFReader)
+    x.state == STATE_CLOSED && return true
+    isempty(BufIO.get_buffer(x)) || return false
+    return iszero(BufIO.fill_buffer(x))
+end
+
+Base.isopen(reader::BGZFReader) = reader.state != STATE_CLOSED
 
 # TODO: Implement isopen
 
@@ -125,7 +161,8 @@ Base.iswritable(::BGZFReader) = false
 # TODO: Seek
 # TODO: Position
 
-function getbuffer(reader::BGZFReader)
+function BufIO.get_buffer(reader::BGZFReader)
+    reader.state == STATE_CLOSED && return @inbounds ImmutableMemoryView(reader.buffer)[1:0]
     block = reader.blocks[reader.reading_block_index]
     return @inbounds ImmutableMemoryView(block.out_data)[reader.read_index:block.out_len]
 end
@@ -151,60 +188,25 @@ end
 # Return whether any block was queued
 function queue!(reader::BGZFReader)::Bool
     buffer = reader.buffer
+    blocks = reader.blocks
+
+    # We queue in a loop, and when we hit EOF we need to check if we
+    # have queued in a previous loop when exiting
     queued_any = false
-    last_block_was_empty = false
-    first_queued_block = 0
 
     while true
-        # We can't know how much data the next block is, so make sure we have at least
-        # a full block, unless we reach EOF.
-        if reader.buffer_filled < MAX_BLOCK_SIZE
-            unfilled = MemoryView(buffer)[(reader.buffer_filled + reader.buffer_start):lastindex(buffer)]
-            @assert !iszero(length(unfilled))
-            # If we don't have enough room for a block, we copy around data in the buffer
-            # to make room.
-            if length(unfilled) < MAX_BLOCK_SIZE
-                copyto!(buffer, 1, buffer, reader.buffer_start, reader.buffer_filled)
-                reader.buffer_start = 1
-                unfilled = MemoryView(buffer)[(reader.buffer_filled + 1):lastindex(buffer)]
-            end
-            n_read = readbytes!(reader.io, unfilled)
-            reader.buffer_filled += n_read
-            if iszero(n_read)
-                if reader.check_truncated
-                    # TODO: proper error handling
-                    error("Truncated file")
-                end
-                reader.underlying_is_eof = true
-                # We might have queued a block in a previous iteration
-                iszero(reader.buffer_filled) && return queued_any
-            end
-        end
+        reader.buffer_filled < MAX_BLOCK_SIZE && fill_internal_buffer!(reader)
+
+        @assert reader.buffer_filled ≥ MAX_BLOCK_SIZE || reader.underlying_is_eof
+
+        iszero(reader.buffer_filled) && return queued_any
+
+        (header_len, block_size) = get_bsize(reader)
+
         filled_view = ImmutableMemoryView(buffer)[
             reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1),
         ]
-        # Parse the header of the gzip block to get the block size
-        extra_fields = reader.gzip_extra_fields
-        GC.@preserve filled_view begin
-            mem = ReadableMemory(pointer(filled_view), length(filled_view) % UInt)
-            parsed_header = parse_gzip_header(mem; extra_data = extra_fields)
-        end
-        if parsed_header isa LibDeflateError
-            # TODO: Handle errors properly
-            bgzferror("Block does not contain a valid gzip header")
-        end
-        header_len, _ = parsed_header
-        bsize = get_bsize(extra_fields, filled_view)
-        if bsize === nothing
-            # TODO: Handle errors properly
-            bgzferror("No GZIP extra field \"BSIZE\"")
-        end
-        # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
-        block_size = bsize % UInt32 + UInt32(1)
-        if block_size > reader.buffer_filled
-            # TODO: Handle errors properly
-            bgzferror("BGZF block size points outside input file")
-        end
+
         # Block is the header, then compressed payload, then two UInt32
         # of the CRC32, and the decompressed length.
         compressed_payload_len = block_size - header_len % UInt32 - UInt32(8)
@@ -212,24 +214,27 @@ function queue!(reader::BGZFReader)::Bool
         decompressed_payload_len = unsafe_bitload(UInt32, filled_view, block_size - 3)
 
         # No point in queueing empty blocks.
-        last_block_was_empty = iszero(decompressed_payload_len)
-        if last_block_was_empty
+        if iszero(decompressed_payload_len)
             reader.buffer_start += block_size
             reader.buffer_filled -= block_size
             continue
         end
 
         # Queue the data in the block
-        blocks = reader.blocks
-        if first_queued_block == 0
-            first_queued_block = reader.writing_block_index
-        end
-        println("Writing to $(reader.writing_block_index)")
         block = blocks[reader.writing_block_index]
+
+        # We only queue idle blocks.
+        state = @atomic :acquire block.state
+        if !queued_any
+            # If this is the first block to queue, the block must be idle.
+            # I.e. we never call `queue!` when there can be zero blocks to queue.
+            @assert state == STATE_IDLE
+        end
+        state == STATE_IDLE || return queued_any
+
         block.crc32 = target_crc32
         block.out_len = decompressed_payload_len
         block.in_len = compressed_payload_len
-        # TODO: Use memcpy here
         copyto!(
             block.in_data,
             1,
@@ -246,79 +251,257 @@ function queue!(reader::BGZFReader)::Bool
         # Now, move on to next block to queue. If no other blocks, exit early
         length(blocks) == 1 && return true
 
-        # We stop queueing once we either:
-        # A) Reach the first block again which we already queued, or
-        # B) Reach a block that already have decompressed content in it
+        # Move to next block to queue
         reader.writing_block_index = next_block_index(reader, Int(reader.writing_block_index))
-        if reader.writing_block_index == first_queued_block
-            return true
-        end
-        block = blocks[reader.writing_block_index]
-        if !iszero(block.out_len)
-            if DEBUG
-                @assert reader.writing_block_index == reader.reading_block_index
-            end
-            return true
-        end
     end
     return
 end
 
-function fillbuffer(reader::BGZFReader)::Int
-    # Check current block is empty, since BGZFReaders cannot expand an existing
-    # buffer.
-    blocks = reader.blocks
-    reading_block_index = reader.reading_block_index % Int
-    block = @inbounds blocks[reading_block_index]
-    if reader.read_index ≤ block.out_len
-        error("Can only call `fillbuffer` on a `BGZFReader` if the buffer is currently empty")
+function fill_internal_buffer!(reader::BGZFReader)::Nothing
+    buffer = reader.buffer
+
+    # If we don't have enough room for a block, we copy around data in the buffer
+    # to make room.
+    unfilled = MemoryView(buffer)[(reader.buffer_filled + reader.buffer_start):lastindex(buffer)]
+    if length(unfilled) < MAX_BLOCK_SIZE
+        copyto!(buffer, 1, buffer, reader.buffer_start, reader.buffer_filled)
+        reader.buffer_start = 1
+        unfilled = MemoryView(buffer)[(reader.buffer_filled + 1):lastindex(buffer)]
     end
-    block.out_len = 0
+    @assert length(unfilled) >= MAX_BLOCK_SIZE
+
+    while reader.buffer_filled < MAX_BLOCK_SIZE
+        n_read = readbytes!(reader.io, unfilled)
+        reader.buffer_filled += n_read
+
+        # This happens if underlying is EOF
+        if iszero(n_read)
+            # Check for EOF block, only if we haven't checked before.
+            if !reader.underlying_is_eof && reader.check_truncated
+                filled = ImmutableMemoryView(buffer)[reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1)]
+                if length(filled) < length(EOF_BLOCK) || filled[(end - length(EOF_BLOCK) + 1):end] != EOF_BLOCK
+                    reader.state = STATE_ERROR
+                    error!(reader, BGZFError(BGZFErrors.TruncatedFile))
+                end
+                reader.buffer_filled -= length(EOF_BLOCK)
+                reader.underlying_is_eof = true
+            end
+            return nothing
+        else
+            reader.underlying_is_eof = false
+        end
+    end
+
+    return nothing
+end
+
+function get_bsize(reader::BGZFReader)
+    buffer = reader.buffer
+
+    filled_view = ImmutableMemoryView(buffer)[
+        reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1),
+    ]
+
+    # Parse the header of the gzip block to get the block size
+    extra_fields = reader.gzip_extra_fields
+    GC.@preserve filled_view begin
+        mem = ReadableMemory(pointer(filled_view), length(filled_view) % UInt)
+        parsed_header = parse_gzip_header(mem; extra_data = extra_fields)
+    end
+
+    if parsed_header isa LibDeflateError
+        error!(reader, BGZFError(parsed_header))
+    end
+    header_len, _ = parsed_header
+    bsize = get_bsize(extra_fields, filled_view)
+    if bsize === nothing
+        error!(reader, BGZFError(BGZFErrors.MissingBCField))
+    end
+    # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
+    block_size = bsize % UInt32 + UInt32(1)
+    if block_size > reader.buffer_filled
+        error!(reader, BGZFError(BGZFErrors.TooLargeBlockSize))
+    end
+
+    return (header_len, block_size)
+end
+
+function BufIO.fill_buffer(reader::BGZFReader)::Union{Nothing, Int}
+    # Check reader state is correct
+    reader.state == STATE_CLOSED && throw(ArgumentError("Operation on closed BGZFReader"))
+    reader.state == STATE_ERROR && throw(reader.error)
+
+    blocks = reader.blocks
+    block = @inbounds blocks[reader.reading_block_index]
+
+    state = @atomic :acquire block.state
+    # State can be idle (if first call, or if repeated calls after EOF)
+    # or done.
+    # It cannot be running, because when moving the reader block to a
+    # running block, it will immediate wait.
+    # It can also not be error, because moving to an error block will propagate
+    # the error to the reader
+    if state == STATE_DONE
+        # If the block already has data, we can't fill the buffer.
+        reader.read_index ≤ block.out_len && return nothing
+
+        # Else, reset the block
+        reader.read_index = 1
+        block.out_len = 0
+        @atomic :release block.state = STATE_IDLE
+
+        # Move to the next block
+        next_index = next_block_index(reader, Int(reader.reading_block_index))
+        reader.reading_block_index = next_index
+        block = @inbounds blocks[next_index]
+        state = @atomic :acquire block.state
+    else
+        @assert state == STATE_IDLE
+    end
 
     # If there's only one block, it's simple: Queue the block and check if it
     # has data
+    # TODO: Have a distinct queue function for sync readers, then have a distinct
+    # fillbuffer function to call here for sync readers?
     if length(blocks) == 1
+        # If the block couldn't be queued, it must be because of EOF
         queue!(reader) || return 0
-        wait(block.task)
-        reader.read_index = 1
+        state = wait(block.task)
+        state == STATE_ERROR && error!(reader, BGZFError(block.error))
         return block.out_len % Int
+    end
+
+    # If the underlying IO is EOF, we defer queuing until we run out of
+    # buffered data. This way, the underlying stream has a chance to
+    # un-EOF, if it has that option.
+    was_eof_at_first = reader.underlying_is_eof
+    was_eof_at_first || queue!(reader)
+
+    # It's possible the next block was queued, so wait for it and update the state
+    state = wait(block)
+
+    if state == STATE_DONE
+        @assert !iszero(block.out_len)
+        return block.out_len
+    elseif state == STATE_ERROR
+        error!(reader, BGZFError(block.error))
+    end
+
+    # If we reached this point, then we've moved the reader block into the next
+    # idle block (which is the writing block).
+    @assert state == STATE_IDLE
+    @assert reader.writing_block_index == reader.reading_block_index
+
+    # State is idle, so either...
+    if was_eof_at_first
+        # We didn't queue before. Now queue, and if none could be queued,
+        # we are EOF
+        queue!(reader) || return 0
     else
-        # If the underlying IO is EOF, we defer queuing until we run out of
-        # buffered data. This way, the underlying stream has a chance to
-        # un-EOF, if it has that option.
-        queued = !reader.underlying_is_eof
-        queued && queue!(reader)
+        # Or else we did queue before, but hit EOF
+        return 0
+    end
 
-        # Move to next block
-        next_index = next_block_index(reader, reading_block_index)
-        block = @inbounds blocks[next_index]
+    # If we reach this point, we just queued the reading block,
+    # and possibly more blocks. Wait for the first block
+    state = wait(block)
 
-        # If it doesn't have any data, it could be because we didn't queue,
-        # as reader was EOF - in that case, re-queue.
-        # Or, it's legitimately empty, in which case, return zero
-        if iszero(block.out_len)
-            queued && return 0
-            queue!(reader) || return 0
-        end
-
-        # We just checked it has data, so here, we just return it
-        wait(block.task)
-
-        out_len = block.out_len
-        if DEBUG
-            @assert !iszero(out_len)
-        end
-        reader.read_index = 1
-        reader.reading_block_index = next_index % UInt32
-        return out_len
+    if state == STATE_DONE
+        @assert !iszero(block.out_len)
+        return block.out_len
+    elseif state == STATE_ERROR
+        error!(reader, BGZFError(block.error))
+    else
+        @assert false # unreachable
     end
 end
 
-function consume(reader::BGZFReader, n::UInt)
-    buf = getbuffer(reader)
-    length(buf) % UInt < n && error("Consumed too much")
+function BufIO.consume(reader::BGZFReader, n::Int)
+    reader.state == STATE_CLOSED && throw(ArgumentError("Operation on closed BGZFReader"))
+    buf = BufIO.get_buffer(reader)
+    length(buf) < n && error("Consumed too much")
     reader.read_index = (reader.read_index + n) % UInt32
     return nothing
 end
+
+#=
+mutable struct BGZFWriter{I <: IO} <: BufIO.AbstractBufWriter
+    const io::IO
+    const blocks::Memory{Blocks.Block{Compressor}}
+
+    # Index of block next write happens to
+    index_of_block::UInt32
+
+    # Next write happens to this index of the block
+    index_in_block::UInt32
+
+    # Index of next block to flush once current write block is full.
+    flush_block_index::UInt32
+
+    write_eof_on_close::Bool
+end
+
+function BufIO.get_buffer(io::BGZFWriter)::MutableMemoryView{UInt8}
+    block = io.blocks[io.index_of_block]
+    return MemoryView(block.in_data)[io.index_in_block:Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE]
+end
+
+function BufIO.consume(io::BGZFWriter, n::Int)::Nothing
+    remaining = Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE = io.index_in_block + 1
+    n > remaining && error("Consumed too much")
+    io.index_in_block += n % UInt32
+    return nothing
+end
+
+function BufIO.fill_buffer(io::BGZFWriter)::Int
+    block = io.blocks[io.index_of_block]
+    # Queue the current block
+    queue!(block)
+    io.index_in_block = 1
+
+    # If one block, wait for it to compress, then ship it out
+    if length(io.blocks) == 1
+        wait(block.task)
+        write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
+        block.in_len = 0
+    else
+        # If more, wait for any done blocks and flush them. This loop does not
+        # wait for blocks to finish.
+        while true
+            block = io.blocks[io.flush_block_index]
+            if istaskdone(block.task)
+                write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
+                block.in_len = 0
+                # If we wrote reached the block we just queued, we are done
+                should_break = io.flush_block_index == io.index_of_block
+                io.flush_block_index = next_block_index(io, io.flush_block_index % Int)
+                should_break && break
+            else
+                # Else, if we need to wait, we are also done
+                break
+            end
+        end
+    end
+
+    # Move to next block
+    io.index_of_block = next_block_index(io, io.index_of_block % Int)
+
+    # The block we just moved to must be empty. If it isn't, we need to wait
+    # for it to finish compressing, and write it out.
+    block = io.blocks[io.index_of_block]
+    if !iszero(block.in_len)
+        wait(block.task)
+        write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
+        block.in_len = 0
+    end
+
+    return Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE
+end
+
+function write(io::BGZFWriter, bytes::ImmutableMemoryView{UInt8})::Int
+    # Write to current write block
+    # Once block is exhausted, flush, then get next available block
+end
+=#
 
 end # module BGZFLib

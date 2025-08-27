@@ -15,14 +15,18 @@ using Base.Threads: @spawn
 using LibDeflate: Compressor,
     Decompressor,
     LibDeflateError,
+    LibDeflateErrors,
     unsafe_decompress!,
-    unsafe_crc32
+    unsafe_crc32,
+    compress!,
+    crc32
 
 using MemoryViews: ImmutableMemoryView
 
-import ..bgzferror, ..unsafe_bitload, ..DE_COMPRESSOR, ..MAX_BLOCK_SIZE
+import ..unsafe_bitload, ..DE_COMPRESSOR, ..MAX_BLOCK_SIZE
+import ..STATE_ERROR, ..STATE_IDLE, ..STATE_DONE, ..STATE_RUNNING
 
-export Block, SAFE_UNCOMPRESSED_BLOCK_SIZE
+export Block, SAFE_UNCOMPRESSED_BLOCK_SIZE, EOF_BLOCK
 
 to_memory(x::Vector) = copy!(Memory{eltype(x)}(undef, length(x)), x)
 
@@ -66,6 +70,13 @@ mutable struct Block{T <: DE_COMPRESSOR}
     # so unfortunately UInt16 will not suffice here.
     out_len::UInt32   # Length of decompressed payload / compressed block
     in_len::UInt32    # Length of compressed payload / total input block
+
+    # 0x00: Idle: May have non-queued data
+    # 0x01: Running
+    # 0x02: Completed
+    # 0x03: Errored
+    @atomic state::UInt8
+    error::LibDeflateError
 end
 
 function Block(dc::T) where {T <: DE_COMPRESSOR}
@@ -74,25 +85,79 @@ function Block(dc::T) where {T <: DE_COMPRESSOR}
 
     # We initialize with a trivial, but completable task for sake of simplicity
     task = schedule(Task(() -> nothing))
-    return Block{T}(dc, out_data, in_data, task, 0, 0, 0)
+    return Block{T}(dc, out_data, in_data, task, 0, 0, 0, STATE_IDLE, LibDeflateErrors.gzip_bad_crc32)
+end
+
+function Base.wait(block::Block{Decompressor})::UInt8
+    state = @atomic :acquire block.state
+    state == STATE_RUNNING || return state
+    wait(block.task)
+    state = @atomic :acquire block.state
+    @assert state in (STATE_DONE, STATE_ERROR)
+    return state
 end
 
 function queue!(block::Block{Decompressor})
-    return block.task = @spawn begin
-        (in_data, out_data) = (block.in_data, block.out_data)
-        GC.@preserve in_data out_data begin
-            compress = unsafe_decompress!(
-                Base.HasLength(),
-                block.de_compressor,
-                pointer(out_data), block.out_len,
-                pointer(in_data), block.in_len
-            )
-            compress isa LibDeflateError && bgzferror("Invalid DEFLATE content in BGZF block")
-            crc32 = unsafe_crc32(pointer(out_data), block.out_len)
-        end
-        crc32 != block.crc32 && bgzferror("CRC32 checksum does not match")
-        return nothing
+    @atomic :release block.state = STATE_RUNNING
+    return block.task = @spawn decompress!(block)
+end
+
+function queue_sync!(block::Block{Decompressor})
+    @atomic :release block.state = STATE_RUNNING
+    return decompress!(block)
+end
+
+function decompress!(block::Block{Decompressor})
+    (in_data, out_data) = (block.in_data, block.out_data)
+    GC.@preserve in_data out_data begin
+        compress = unsafe_decompress!(
+            Base.HasLength(),
+            block.de_compressor,
+            pointer(out_data), block.out_len,
+            pointer(in_data), block.in_len
+        )
     end
+    if compress isa LibDeflateError
+        block.error = compress
+        @atomic :release block.state = STATE_ERROR
+    else
+        crc32 = unsafe_crc32(pointer(out_data), block.out_len)
+        if crc32 != block.crc32
+            block.error = LibDeflateErrors.gzip_bad_crc32
+            @atomic :release block.state = STATE_ERROR
+        else
+            @atomic :release block.state = STATE_DONE
+        end
+    end
+    return nothing
+end
+
+function queue!(block::Block{Compressor})
+    # Empty blocks can be compressed manually with the following result
+    if iszero(block.in_len)
+        block.crc32 = 0
+        block.out_len = 2
+        block.out_data[1] = 0x03
+        block.out_data[2] = 0x00
+        @atomic :release block.state = STATE_DONE
+        return nothing
+    else
+        @atomic :release block.state = STATE_RUNNING
+        block.task = @spawn begin
+            in_data = view(block.in_data, 1:block.in_len)
+            block.crc32 = crc32(in_data)
+            result = compress!(block.de_compressor, block.out_data, in_data)
+            if result isa LibDeflateError
+                block.error = result
+                @atomic :release block.state = STATE_ERROR
+            else
+                block.out_len = result
+                @atomic :release block.state = STATE_DONE
+            end
+            nothing
+        end
+    end
+    return nothing
 end
 
 end # module
