@@ -1,10 +1,3 @@
-"""
-    BGZF blocks
- 
-Code in this file should not "know about" Codecs, TranscodingStreams,
-or any of that. It should only rely on Base and LibDeflate, so that means the
-code in this file can easily be cannibalized for other packages, or repurposed.
-"""
 module Blocks
 
 # TODO: Update LibDeflate to handle memory views, to remove all pointer
@@ -64,6 +57,10 @@ mutable struct Block{T <: DE_COMPRESSOR}
     const out_data::Memory{UInt8}
     const in_data::Memory{UInt8}
     task::Task
+
+    # Offset in file where the block begins. Only used for decompresing
+    # blocks.
+    file_offset::Int
     crc32::UInt32    # stated checksum / calculated checksum
 
     # BGZF blocks can store 0:typemax(UInt16)+1 bytes
@@ -79,13 +76,21 @@ mutable struct Block{T <: DE_COMPRESSOR}
     error::LibDeflateError
 end
 
+function Base.reset(block::Block)
+    block.out_len = 0
+    block.in_len = 0
+    block.file_offset = 0
+    @atomic :release block.state = STATE_IDLE
+    return block
+end
+
 function Block(dc::T) where {T <: DE_COMPRESSOR}
     out_data = Memory{UInt8}(undef, MAX_BLOCK_SIZE % Int)
     in_data = similar(out_data)
 
-    # We initialize with a trivial, but completable task for sake of simplicity
-    task = schedule(Task(() -> nothing))
-    return Block{T}(dc, out_data, in_data, task, 0, 0, 0, STATE_IDLE, LibDeflateErrors.gzip_bad_crc32)
+    # We initialize with the current task, arbitrarily
+    task = current_task()
+    return Block{T}(dc, out_data, in_data, task, 0, 0, 0, 0, STATE_IDLE, LibDeflateErrors.gzip_bad_crc32)
 end
 
 function Base.wait(block::Block{Decompressor})::UInt8
@@ -132,6 +137,7 @@ function decompress!(block::Block{Decompressor})
     return nothing
 end
 
+#=
 function queue!(block::Block{Compressor})
     # Empty blocks can be compressed manually with the following result
     if iszero(block.in_len)
@@ -144,7 +150,7 @@ function queue!(block::Block{Compressor})
     else
         @atomic :release block.state = STATE_RUNNING
         block.task = @spawn begin
-            in_data = view(block.in_data, 1:block.in_len)
+            in_data = ImmutableMemoryView(block.in_data)[1:block.in_len]
             block.crc32 = crc32(in_data)
             result = compress!(block.de_compressor, block.out_data, in_data)
             if result isa LibDeflateError
@@ -159,5 +165,6 @@ function queue!(block::Block{Compressor})
     end
     return nothing
 end
+=#
 
 end # module
