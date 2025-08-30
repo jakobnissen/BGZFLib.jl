@@ -224,7 +224,7 @@ end
 
 function BufIO.get_buffer(reader::BGZFReader)
     reader.state == STATE_IDLE || throw(reader.error)
-    block = reader.blocks[reader.reading_block_index]
+    block = @inbounds reader.blocks[reader.reading_block_index]
     return @inbounds ImmutableMemoryView(block.out_data)[reader.read_index:block.out_len]
 end
 
@@ -298,11 +298,8 @@ function queue!(reader::BGZFReader, ::Val{is_sync})::Bool where {is_sync}
         block.out_len = decompressed_payload_len
         block.in_len = compressed_payload_len
         copyto!(
-            block.in_data,
-            1,
-            filled_view,
-            header_len + 1,
-            compressed_payload_len
+            MemoryView(block.in_data)[1:compressed_payload_len],
+            filled_view[header_len + 1 : header_len + compressed_payload_len]
         )
         reader.buffer_start += block_size
         reader.buffer_filled -= block_size
