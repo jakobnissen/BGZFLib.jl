@@ -7,7 +7,7 @@ using LibDeflate: ReadableMemory,
     Compressor,
     Decompressor,
     GzipExtraField,
-    parse_gzip_header,
+    unsafe_parse_gzip_header,
     LibDeflateError,
     LibDeflateErrors
 
@@ -73,9 +73,6 @@ mutable struct BGZFReader{I <: IO} <: BufIO.AbstractBufReader
     # This is not const, because we replace it with an empty memory once the reader is closed
     blocks::Memory{Blocks.Block{Decompressor}}
 
-    # We read from `io` in here.
-    const buffer::Memory{UInt8}
-
     # We need these to parse in gzip header, to find the BC field
     # in order to know the block size
     const gzip_extra_fields::Vector{GzipExtraField}
@@ -86,9 +83,6 @@ mutable struct BGZFReader{I <: IO} <: BufIO.AbstractBufReader
 
     # Read from this index in the current block
     read_index::UInt32
-
-    # Number of bytes filled in buffer field
-    buffer_filled::UInt32
 
     # Starting index of buffer
     buffer_start::UInt32
@@ -130,18 +124,12 @@ function BGZFReader(
     for i in eachindex(blocks)
         blocks[i] = Blocks.Block(Decompressor())
     end
-    buffer = Memory{UInt8}(undef, (8 * MAX_BLOCK_SIZE) % Int)
-    if DEBUG
-        fill!(buffer, 0xaa)
-    end
     return BGZFReader{typeof(io)}(
         io,
         blocks,
-        buffer,
         sizehint!(GzipExtraField[], 4),
         0,
         1,
-        0,
         1,
         1,
         1,
@@ -194,7 +182,6 @@ function reset_no_seek(reader::BGZFReader, threads::Int)
     reader.state = STATE_IDLE
     reader.n_bytes_read = 0
     reader.buffer_start = 1
-    reader.buffer_filled = 0
     reader.reading_block_index = 1
     reader.writing_block_index = 1
     reader.underlying_is_eof = false
@@ -248,40 +235,17 @@ end
 # the first non-idle block, or whereever we reached if EOF.
 # Return whether any block was queued
 function queue!(reader::BGZFReader, ::Val{is_sync})::Bool where {is_sync}
-    buffer = reader.buffer
     blocks = reader.blocks
+    last_block_was_empty = false
+
+    # Sync means we only use one block
+    @assert is_sync ⊻ (length(blocks) > 1)
 
     # We queue in a loop, and when we hit EOF we need to check if we
     # have queued in a previous loop when exiting
     queued_any = false
 
     while true
-        reader.buffer_filled < MAX_BLOCK_SIZE && fill_internal_buffer!(reader)
-
-        @assert reader.buffer_filled ≥ MAX_BLOCK_SIZE || reader.underlying_is_eof
-
-        iszero(reader.buffer_filled) && return queued_any
-
-        (header_len, block_size) = get_bsize(reader)
-
-        filled_view = ImmutableMemoryView(buffer)[
-            reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1),
-        ]
-
-        # Block is the header, then compressed payload, then two UInt32
-        # of the CRC32, and the decompressed length.
-        compressed_payload_len = block_size - header_len % UInt32 - UInt32(8)
-        target_crc32 = unsafe_bitload(UInt32, filled_view, block_size - 7)
-        decompressed_payload_len = unsafe_bitload(UInt32, filled_view, block_size - 3)
-
-        # No point in queueing empty blocks.
-        if iszero(decompressed_payload_len)
-            reader.buffer_start += block_size
-            reader.buffer_filled -= block_size
-            continue
-        end
-
-        # Queue the data in the block
         block = blocks[reader.writing_block_index]
 
         # We only queue idle blocks.
@@ -293,17 +257,30 @@ function queue!(reader::BGZFReader, ::Val{is_sync})::Bool where {is_sync}
         end
         state == STATE_IDLE || return queued_any
 
-        block.file_offset = reader.n_bytes_read - reader.buffer_filled
-        block.crc32 = target_crc32
-        block.out_len = decompressed_payload_len
-        block.in_len = compressed_payload_len
-        copyto!(
-            MemoryView(block.in_data)[1:compressed_payload_len],
-            filled_view[header_len + 1 : header_len + compressed_payload_len]
-        )
-        reader.buffer_start += block_size
-        reader.buffer_filled -= block_size
+        n_decompressed = fill_writing_block!(reader, block)
+        if isnothing(n_decompressed)
+            # This indicates EOF. Check the last block was empty - the BAM EOF marker.
+            # Note that since we skip empty blocks, this is guaranteed to occur in
+            # this same call too `queue!` in a previous loop.
+            if !reader.underlying_is_eof && reader.check_truncated && !last_block_was_empty
+                error!(reader, BGZFError(BGZFErrors.TruncatedFile))
+            end
 
+            # Set this such that if we continuously try to read when EOF, we don't
+            # accidentally hit the EOF check again.
+            reader.underlying_is_eof = true
+            return queued_any
+        end
+
+        if iszero(n_decompressed)
+            # Don't try to decompress empty files.
+            last_block_was_empty = true
+            continue
+        else
+            last_block_was_empty = false
+        end
+
+        # If one block, queue and return (since there are no more blocks to queue)
         if is_sync
             Blocks.queue_sync!(block)
             return true
@@ -318,77 +295,68 @@ function queue!(reader::BGZFReader, ::Val{is_sync})::Bool where {is_sync}
     return false # unreachable
 end
 
-function fill_internal_buffer!(reader::BGZFReader)::Nothing
-    buffer = reader.buffer
-
-    # If we don't have enough room for a block, we copy around data in the buffer
-    # to make room.
-    unfilled = MemoryView(buffer)[(reader.buffer_filled + reader.buffer_start):lastindex(buffer)]
-    if length(unfilled) < MAX_BLOCK_SIZE
-        copyto!(buffer, 1, buffer, reader.buffer_start, reader.buffer_filled)
-        reader.buffer_start = 1
-        unfilled = MemoryView(buffer)[(reader.buffer_filled + 1):lastindex(buffer)]
+function read_all!(buffer::MutableMemoryView{UInt8}, io::IO)::Int
+    n_read_total = 0
+    while !isempty(buffer)
+        n_read = readbytes!(io, buffer)
+        iszero(n_read) && return n_read_total
+        n_read_total += n_read
+        buffer = @inbounds buffer[(n_read + 1):end]
     end
-    @assert length(unfilled) >= MAX_BLOCK_SIZE
-
-    while reader.buffer_filled < MAX_BLOCK_SIZE
-        n_read = readbytes!(reader.io, unfilled)
-        reader.buffer_filled += n_read
-        reader.n_bytes_read += n_read
-
-        # This happens if underlying is EOF
-        if iszero(n_read)
-            # Check for EOF block, only if we haven't checked before.
-            if !reader.underlying_is_eof && reader.check_truncated
-                filled = ImmutableMemoryView(buffer)[reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1)]
-                if length(filled) < length(EOF_BLOCK) || filled[(end - length(EOF_BLOCK) + 1):end] != EOF_BLOCK
-                    reader.state = STATE_ERROR
-                    error!(reader, BGZFError(BGZFErrors.TruncatedFile))
-                end
-                # We basically pretend we never saw the block.
-                # This allows virtualoffsets to work correctly
-                reader.buffer_filled -= length(EOF_BLOCK)
-                reader.n_bytes_read -= length(EOF_BLOCK)
-                reader.underlying_is_eof = true
-            end
-            return nothing
-        else
-            reader.underlying_is_eof = false
-        end
-    end
-
-    return nothing
+    return n_read_total
 end
 
-function get_bsize(reader::BGZFReader)
-    buffer = reader.buffer
+# Returns number of decompressed bytes, or nothing if EOF
+function fill_writing_block!(reader::BGZFReader, block::Blocks.Block{Decompressor})::Union{Nothing, Int}
+    buffer = MemoryView(block.in_data)
+    offset_at_block_start = reader.n_bytes_read
 
-    filled_view = ImmutableMemoryView(buffer)[
-        reader.buffer_start:(reader.buffer_start + reader.buffer_filled - 1),
-    ]
+    n_read = read_all!(@inbounds(buffer[1:12]), reader.io)
+    reader.n_bytes_read += n_read
+    iszero(n_read) && return nothing
+    n_read == 12 || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
 
-    # Parse the header of the gzip block to get the block size
+    ex_len = (@inbounds buffer[11] % Int) | ((@inbounds buffer[12] % Int) << 8)
+    n_read = read_all!(@inbounds(buffer[13:(ex_len + 12)]), reader.io)
+    reader.n_bytes_read += n_read
+    n_read == ex_len || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
+
     extra_fields = reader.gzip_extra_fields
-    GC.@preserve filled_view begin
-        mem = ReadableMemory(pointer(filled_view), length(filled_view) % UInt)
-        parsed_header = parse_gzip_header(mem; extra_data = extra_fields)
+    GC.@preserve buffer begin
+        parsed_header = unsafe_parse_gzip_header(pointer(buffer), (12 + ex_len) % UInt, extra_fields)
     end
 
-    if parsed_header isa LibDeflateError
-        error!(reader, BGZFError(parsed_header))
-    end
-    header_len, _ = parsed_header
-    bsize = get_bsize(extra_fields, filled_view)
-    if bsize === nothing
-        error!(reader, BGZFError(BGZFErrors.MissingBCField))
-    end
-    # By spec, BSIZE is block size -1. Include header_len bytes header, 8 byte tail
-    block_size = bsize % UInt32 + UInt32(1)
-    if block_size > reader.buffer_filled
-        error!(reader, BGZFError(BGZFErrors.TooLargeBlockSize))
-    end
+    parsed_header isa LibDeflateError && error!(reader, BGZFError(parsed_header))
 
-    return (header_len, block_size)
+    fieldnum = findfirst(extra_fields) do field
+        field.tag === (UInt8('B'), UInt8('C'))
+    end
+    fieldnum === nothing && error!(reader, BGZFError(BGZFErrors.MissingBCField))
+
+    field = @inbounds extra_fields[fieldnum]
+    field.data === nothing && return error!(reader, BGZFError(BGZFErrors.MissingBCField))
+    length(field.data) != 2 && return error!(reader, BGZFError(BGZFErrors.MissingBCField))
+
+    bc = (buffer[first(field.data)] % UInt16) | ((buffer[last(field.data)] % UInt16) << 8)
+
+    # Block size is bc + 1
+    # We already read ex_len + 12 bytes
+    # So remaining is bc + 1 - ex_len - 12
+    rest_len = bc + 1 - ex_len - 12
+    n_read = read_all!(@inbounds(buffer[1:rest_len]), reader.io)
+    reader.n_bytes_read += n_read
+    n_read == rest_len || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
+
+    compressed_payload_len = rest_len - 8
+    target_crc32 = unsafe_bitload(UInt32, ImmutableMemoryView(buffer), rest_len - 7)
+    decompressed_payload_len = unsafe_bitload(UInt32, ImmutableMemoryView(buffer), rest_len - 3)
+
+    block.crc32 = target_crc32
+    block.out_len = decompressed_payload_len
+    block.in_len = compressed_payload_len
+    block.file_offset = offset_at_block_start
+
+    return decompressed_payload_len
 end
 
 function BufIO.fill_buffer(reader::BGZFReader)::Union{Nothing, Int}

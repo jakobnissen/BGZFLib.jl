@@ -10,6 +10,7 @@ MemoryViews = "a791c907-b98b-4e44-8f4d-e4c2362c6b2f"
 
 [sources]
 BufIO = {path = "../BufIO.jl"}
+LibDeflate = {path = "../LibDeflate.jl"}
 MemoryViews = {path = "../MemoryViews.jl"}
 
 [compat]
