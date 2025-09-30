@@ -1,6 +1,6 @@
 using BGZFLib
 using Test
-using BufIO: consume, fill_buffer, get_buffer
+using BufferIO: consume, fill_buffer, get_buffer
 
 @testset "Basic reading" begin
     block_content_1 = [
