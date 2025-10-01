@@ -1,587 +1,861 @@
 module BGZFLib
 
-#=
-TODO: The performance is not acceptable. Some rough measurements are:
-* compressed filesize: 3.9 GB
-* num blocks: 139683
+# TODO: Tests.
+# TODO: Writers
 
-* libdeflate decompression, no parsing: 10.1 s
-* 1  thread BGZFLib: 11.38 s
-* 2  thread BGZFLib: ~13 s
-* 4  thread BGZFLib: ~7 s
-* 8  thread BGZFLib: ~3.6 s
-* 16 thread BGZFLib: ~2.2 s
-
-Starting Julia w. 2 threads, we have ~7s for 2 threads.
-
-Note that BGZF special-cases threads == 1 and do not spawn
-tasks in that case but run everything in the main task
-
-For 2 tasks w 16 threads total Time is spent in:
-* 85.35% wait (idle thread)
-* 7.6 % decompressing (vs 5.7 for single thread)
-* 4.1 % waiting in main task for next block which is currently decompressing
-* 1.045 in Blocks.queue! (spawning task, almost only) 
-* 0.94% in reading from file
-
-This suggests that:
-* Parsing is very fast (> 4GB/s), and not a bottleneck
-* Scaling with threads is pretty good
-* The scheduler consumes most the benefits of multithreading
-
-Solutions:
-* Do more work per task. Maybe read 16 blocks instead of one.
-    - inflate memory
-    - larger upfront cost
-
-* Spawn N tasks up front, communicate via a channel
-=#
-
-const DEBUG = true
-
-using MemoryViews: ImmutableMemoryView, MutableMemoryView, MemoryView
+using MemoryViews: MemoryView, ImmutableMemoryView, MutableMemoryView
 using LibDeflate: Compressor,
     Decompressor,
     GzipExtraField,
     unsafe_parse_gzip_header,
+    unsafe_decompress!,
+    unsafe_compress!,
+    unsafe_crc32,
     LibDeflateError,
     LibDeflateErrors
 
-using BufferIO: BufferIO
+using BufferIO: BufferIO,
+    AbstractBufReader,
+    BufReader,
+    IOError,
+    IOErrorKinds,
+    get_buffer,
+    get_nonempty_buffer,
+    fill_buffer,
+    consume
 
-export VirtualOffset, BGZFReader, BGZFError
+export BGZFReader, SyncBGZFReader, BGZFErrors, VirtualOffset, virtual_seek, virtual_position
+public BGZFErrorType
 
-# BGZF blocks are no larger than 64 KiB before and after compression.
-const MAX_BLOCK_SIZE = UInt(64 * 1024)
-
-# Blocks can be idle, running, done or error
-# Reader can be idle, error or closed
-const STATE_IDLE = 0x00
-const STATE_RUNNING = 0x01
-const STATE_DONE = 0x02
-const STATE_ERROR = 0x03
-const STATE_CLOSED = 0x04
+const MAX_BLOCK_SIZE = 2^16
+const DUMMY_BUFFER = Memory{UInt8}()
 
 module BGZFErrors
-
     @enum BGZFErrorType::UInt8 begin
-        TruncatedFile
-        MissingBCField
-        TooLargeBlockSize
-        ClosedStream
-        VOTooHighBlock
-        VOOutOfBlock
+        truncated_file
+        missing_bc_field
+        inblock_offset_out_of_bounds
     end
 
     export BGZFErrorType
-
 end # module BGZFErrors
 
 using .BGZFErrors
 
+"""
+    BGZFError <: Exception
+
+Exception type thrown by BGZF readers and writers, when encountering errors specific to
+the BGZF (or gzip, or DEFLATE) formats.
+Note that exceptions thrown by BGZF readers and writers are not guaranteed to be of this type,
+as they may also throw `BufferIO.IOError`s, or exceptions propagated by their underlying IO.
+
+This error contains two public properties:
+* `block_offset::Union{Nothing, Int}` gives the zero-based offset in the compressed stream
+   of the block where the error occurred.
+   Some errors may not occur at a specific block, in which case this is `nothing`.
+* `type::Union{BGZFErrorType, LibDeflateError}`. If the blocks are malformed gzip blocks, this
+   is a `LibDeflateError`. Else, if the error is specific to the BGZF format, it's a BGZFErrorType.
+"""
 struct BGZFError <: Exception
+    # Block occurred in the block with this file offset (zero-based),
+    # except for some errors which are not block-specific
+    block_offset::Union{Nothing, Int}
     type::Union{BGZFErrorType, LibDeflateError}
 end
 
 const BitInteger = Union{UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64}
 
-# By specs, BAM files are always little-endian
+# By specs, BGZF files are always little-endian
 function unsafe_bitload(T::Type{<:BitInteger}, data::ImmutableMemoryView{UInt8}, p::Integer)
     return GC.@preserve data ltoh(unsafe_load(Ptr{T}(pointer(data, p))))
 end
 
-# By specs, BAM files are always little-endian
-function unsafe_bitstore!(v::BitInteger, data::ImmutableMemoryView{UInt8}, p::Integer)
+# By specs, BGZF files are always little-endian
+function unsafe_bitstore!(v::BitInteger, data::MutableMemoryView{UInt8}, p::Integer)
     return GC.@preserve data unsafe_store!(Ptr{typeof(v)}(pointer(data, p)), htol(v))
 end
 
-const DE_COMPRESSOR = Union{Compressor, Decompressor}
+"""
+VirtualOffset(file_offset::Integer, block_offset::Integer)
 
-include("block.jl")
+Create a BGZF virtual file offset from `file_offset` and `block_offset`.
+Get the two offsets with the public properties `vo.file_offset` and `vo.block_offset`
 
-import .Blocks: Blocks, EOF_BLOCK
+A `VirtualOffset` contains the two zero-indexed offset: The "file offset",
+which is the offset in the *compressed* BGZF file that marks the beginning of
+the block with the given position, and an "block offset" which is the
+offset of the *uncompressed* content of that block.
 
-include("virtualoffset.jl")
+The valid ranges of these two are `0:2^48-1` and `0:2^16-1`, respectively.
+"""
+struct VirtualOffset
+    x::UInt64
 
-mutable struct BGZFReader{I <: IO} <: BufferIO.AbstractBufReader
-    const io::I
+    function VirtualOffset(file_offset::Integer, block_offset::Integer)
+        file_offset = UInt64(file_offset)::UInt64
+        block_offset = UInt64(block_offset)::UInt64
+        if file_offset ≥ 2^48
+            throw(ArgumentError("block file offset must be in 0:281474976710655"))
+        end
+        if block_offset ≥ 2^16
+            throw(ArgumentError("in-block offset must be in 0:65535"))
+        end
+        return new((UInt64(file_offset) << 16) | UInt64(block_offset))
+    end
+end
 
-    # This is not const, because we replace it with an empty memory once the reader is closed
-    blocks::Memory{Blocks.Block{Decompressor}}
+Base.propertynames(::VirtualOffset) = (:file_offset, :block_offset)
 
-    # We need these to parse in gzip header, to find the BC field
-    # in order to know the block size
+function Base.getproperty(vo::VirtualOffset, s::Symbol)
+    return if s === :file_offset
+        getfield(vo, :x) >>> 16
+    elseif s === :block_offset
+        getfield(vo, :x) % UInt16
+    else
+        getfield(vo, s)
+    end
+end
+
+function Base.show(io::IO, x::VirtualOffset)
+    return print(io, summary(x), '(', x.file_offset, ", ", x.block_offset, ')')
+end
+
+const BLOCKS_PER_PACKAGE = 4
+const BUFREADER_BUFFER_SIZE = 2 * MAX_BLOCK_SIZE
+
+# The decompressor worker gets a vector of these, each representing one block
+# to be decompressed
+struct ReaderBlockWork
+    source::ImmutableMemoryView{UInt8}
+    destination::Memory{UInt8}
+    file_offset::Int
+    expected_crc32::UInt32
+    decompressed_len::UInt32
+end
+
+# One package (i.e. workload) for a decompressor worker task.
+struct ReaderWorkPackage
+    # io.n_buffers_shipped_or_skipped when this package was constructed
+    buffer_offset::Int
+    block_works::Vector{ReaderBlockWork}
+end
+
+struct ReaderPackageResult
+    # Copied from the corresponding ReaderWorkPackage
+    buffer_offset::Int
+    # (file_offset, decompressed_data), or an error for each block, in order
+    results::Vector{Union{BGZFError, Tuple{Int, ImmutableMemoryView{UInt8}}}}
+    # This contains all the memory backing the `ReaderBlockWork.source`, which
+    # need to be recycled. If the `results` contain any errors, it also contains
+    # the Memory backing the view which would otherwise be in the `results`
+    buffers::Vector{Memory{UInt8}}
+end
+
+const STATE_OPEN = 0x00
+const STATE_CLOSED = 0x01
+const STATE_ERROR = 0x02
+
+"""
+    BGZFReader(io::T <: IO; n_workers::Int, check_truncated::Bool=true)::BGZFReader{BufReader{T}}
+    BGZFReader(io::T <: AbstractBufReader; n_workers::Int, check_truncated::Bool=true)::BGZFReader{T}
+
+Create a `BGZFReader <: AbstractBufReader` that decompresses a BGZF stream.
+
+When constructing from an `io::AbstractBufReader`, `io` must have a buffer size of at least
+$(MAX_BLOCK_SIZE), or be able to grow its buffer to this size.
+
+If `check_truncated`, the last BGZF block in the file must be empty, otherwise the reader
+throws an error. This can be used to detect the file was truncated.
+
+The decompression happens asyncronously in a set of worker tasks. To avoid spawning workers,
+use the `SyncBGZFReader` instead.
+
+If the reader encounters an error, it goes into an error state and throws an exception.
+The reader can be reset by using `seek` or `seekstart`. A closed reader cannot be reset.
+"""
+mutable struct BGZFReader{T <: AbstractBufReader} <: AbstractBufReader
+    # This needs to have at least 2^16 bytes buffersize.
+    const io::T
+
+    # Cached so the main task does not have to allocate a new vector all the time
     const gzip_extra_fields::Vector{GzipExtraField}
 
-    # Number of bytes read from the underlying IO.
-    # Used to report position.
+    # Buffers can be: in the `io.buffer` field, in workers, in either of the two channels,
+    # or in the result queue. All remaining buffers are stored here. They are all recycled,
+    # so we never have to allocate new ones.
+    const buffer_pool::Vector{Memory{UInt8}}
+
+    # This is a FIFO queue. We take results from the receiver, and place it in this queue,
+    # using the package index to order the results correctly.
+    # `nothing` indicates that this package has not yet been received, i.e. if we receive
+    # packages 1 and 3, then index 2 is nothing.
+    # A non-error result is (file_offset of block, decompressed block)
+    const result_queue::Vector{Union{Nothing, BGZFError, Tuple{Int, ImmutableMemoryView{UInt8}}}}
+    const sender::Channel{ReaderWorkPackage}
+    const receiver::Channel{ReaderPackageResult}
+    const workers::Memory{Task}
+
+    # Buffers popped off the result queue (using popfirst!) and go here.
+    # After it is used up, its parent is recycled and goes to the buffer pool.
+    # It's initialized with an empty memory which is discarded, not recycled
+    buffer::Memory{UInt8}
+    buffer_pos::Int
+    buffer_filled::Int
+
+    # This is essentially only used for `position(io)`. It gives the offset in the compressed file
+    # of the current active buffer
+    current_block_offset::Int
+
+    # We keep track of the number of buffers we've shipped to workers, and how many we've
+    # received from workers. This has three purposes:
+    # First, each work package contains the buffer offset (i.e. buffers shipped before this one),
+    # so that received work can be ordered correctly.
+    # Second, we can check if there are any data in the workers or the channels by comparing
+    # these two numbers. This tells us e.g. if we're really EOF, and whether we can safely wait
+    # for more data from workers without deadlocking.
+    # Third, it allows us to invalidate results from workers when skipping or seeking.
+    # If we increment these counters and also `queue_n_removed` by a lot, then any data from workers
+    # will have a negative index in the queue. This signals the data is invalid and can be discarded.
+    n_buffers_shipped_or_skipped::Int
+    n_buffers_received_or_skipped::Int
+
+    # In order to allow us to discard data from the queue and still compute the correct ordering,
+    # need to keep track of how many we `popfirst!`ed. I.e. if we get the Nth buffer, it should
+    # go to index `N - queue_n_removed` in the result queue
+    queue_n_removed_or_skipped::Int
+
+    # Bytes read from the underlying IO. Each buffer processed by a worker must keep
+    # track of the (zero based) file offset to report position.
     n_bytes_read::Int
 
-    # Read from this index in the current block
-    read_index::UInt32
-
-    # Starting index of buffer
-    buffer_start::UInt32
-
-    # Current block to read from
-    reading_block_index::UInt32
-
-    # Block to write data to next.
-    writing_block_index::UInt32
-
-    # If `reader.io` has been seen to be eof, we set this.
-    # We unset it automatically if the underlying IO un-EOFs
-    underlying_is_eof::Bool
-
-    # Check for an empty BGZF block at EOF, and throw an error
-    # if not found
+    # Error if EOF is reached and last block was not empty. This is a BGZF feature.
     check_truncated::Bool
-
-    state::UInt8
-
-    error::BGZFError
+    last_was_empty::Bool
+    state::UInt8 # open, closed or error
 end
-
-function error!(reader::BGZFReader, error::BGZFError)::Union{}
-    reader.state = STATE_ERROR
-    reader.error = error
-    throw(error)
-end
-
-next_block_index(r::BGZFReader, i::Int) = i ≥ length(r.blocks) ? 1 : i + 1
 
 function BGZFReader(
-        io::IO;
-        threads::Int = Threads.nthreads(),
+        io::AbstractBufReader;
+        n_workers::Int = min(4, Threads.nthreads()),
         check_truncated::Bool = true
     )
-    threads < 1 && throw(ArgumentError("Must use at least one thread to read"))
-    blocks = Memory{Blocks.Block{Decompressor}}(undef, threads)
-    for i in eachindex(blocks)
-        blocks[i] = Blocks.Block(Decompressor())
+    n_workers < 1 && throw(ArgumentError("Must have at least one worker"))
+    sender = Channel{ReaderWorkPackage}(Inf)
+    receiver = Channel{ReaderPackageResult}(Inf)
+    # Each worker chunk ('package') contains 1 input and 1 output buffer per block
+    pool = [Memory{UInt8}(undef, MAX_BLOCK_SIZE) for _ in 1:total_buffers(n_workers)]
+    workers = Memory{Task}(undef, n_workers)
+    for i in 1:n_workers
+        task = Threads.@spawn worker_loop(sender, receiver)
+        workers[i] = task
     end
     return BGZFReader{typeof(io)}(
         io,
-        blocks,
-        sizehint!(GzipExtraField[], 4),
-        0,
-        1,
-        1,
-        1,
-        1,
-        false,
+        Vector{GzipExtraField}(),
+        pool,
+        Vector{Union{Nothing, BGZFError, Tuple{Int, ImmutableMemoryView{UInt8}}}}(),
+        sender,
+        receiver,
+        workers,
+        DUMMY_BUFFER,
+        1, # pos
+        0, # buffer filled
+        0, # block offset
+        0, # packages shipped
+        0, # packages received
+        0, # buffers consumed
+        0, # bytes read
         check_truncated,
-        STATE_IDLE,
-        BGZFError(BGZFErrors.TruncatedFile), # arbitrary value
+        false,
+        STATE_OPEN,
     )
 end
 
-function Base.close(reader::BGZFReader)
-    reader.state == STATE_CLOSED && return nothing
-    reader.state = STATE_CLOSED
-    reader.error = BGZFError(BGZFErrors.ClosedStream)
-    # Free underlying resources
-    reader.blocks = Memory{Blocks.Block{Decompressor}}()
-    return close(reader.io)
+# I don't quite understand why, but adding some extra buffers makes the workers wait less and speeds
+# up the code. It costs about 256 KiB memory per extra buffering, so we add it sparingly.
+extra_buffering(n_workers::Int) = min(4, cld(n_workers, 2))
+
+function total_buffers(n_workers::Int)
+    return 2 * (n_workers + extra_buffering(n_workers)) * BLOCKS_PER_PACKAGE
 end
 
-function Base.eof(x::BGZFReader)
-    x.state == STATE_CLOSED && return true
-    isempty(BufferIO.get_buffer(x)) || return false
-    # This can't be nothing, because that should only happen
-    # if the current buffer is not empty.
-    return iszero(something(BufferIO.fill_buffer(x)))
-end
-
-Base.isopen(reader::BGZFReader) = reader.state != STATE_CLOSED
-Base.iswritable(::BGZFReader) = false
-
-function Base.reset(reader::BGZFReader, threads::Int)
-    threads < 1 && throw(ArgumentError("Must reset with at least 1 thread"))
-    seekstart(reader.io)
-    return reset_no_seek(reader, threads)
-end
-
-function reset_no_seek(reader::BGZFReader, threads::Int)
-    seekstart(reader.io)
-    if isempty(reader.blocks)
-        blocks = Memory{Blocks.Block{Decompressor}}(undef, threads)
-        for i in eachindex(blocks)
-            blocks[i] = Blocks.Block(Decompressor())
-        end
-        reader.blocks = blocks
-    else
-        for block in reader.blocks
-            reset(block)
-        end
-    end
-    reader.state = STATE_IDLE
-    reader.n_bytes_read = 0
-    reader.buffer_start = 1
-    reader.reading_block_index = 1
-    reader.writing_block_index = 1
-    reader.underlying_is_eof = false
-    return reader
-end
-
-"""
-    virtual_seek(reader::BGZFReader, v::VirtualOffset)
-
-Seek to the position `v`.
-
-If `offsets(v) == (a, b)`, then first seek the underlying IO of `reader` to `a`,
-then skip `b` bytes.
-"""
-function virtual_seek(reader::BGZFReader, v::VirtualOffset)
-    reader.state == STATE_CLOSED && throw(BGZFError(BGZFErrors.ClosedStream))
-    reset_no_seek(reader, 0)
-    (block_offset, inblock_offset) = offsets(v)
-    seek(reader.io, block_offset)
-    BufferIO.fill_buffer(reader)
-    block = reader.blocks[reader.reading_block_index]
-    if block.out_len < inblock_offset
-        error!(reader, BGZFError(BGZFErrors.VOOutOfBlock))
-    end
-    return BufferIO.consume(reader, Int(inblock_offset))
-end
-
-function Base.position(reader::BGZFReader)
-    block = reader.blocks[reader.reading_block_index]
-    return VirtualOffset(
-        block.file_offset,
-        reader.read_index - 1
+function BGZFReader(
+        io::IO;
+        n_workers::Int = min(4, Threads.nthreads()),
+        check_truncated::Bool = true
     )
+    n_workers < 1 && throw(ArgumentError("Must have at least one worker"))
+    bufio = BufReader(io, BUFREADER_BUFFER_SIZE)
+    return BGZFReader(bufio; n_workers, check_truncated)
 end
 
-function BufferIO.get_buffer(reader::BGZFReader)
-    reader.state == STATE_IDLE || throw(reader.error)
-    block = @inbounds reader.blocks[reader.reading_block_index]
-    return @inbounds ImmutableMemoryView(block.out_data)[reader.read_index:block.out_len]
-end
+BufferIO.get_buffer(io::BGZFReader) = ImmutableMemoryView(io.buffer)[io.buffer_pos:io.buffer_filled]
 
-function get_bsize(
-        fields::Vector{GzipExtraField},
-        data::ImmutableMemoryView{UInt8}
-    )::Union{UInt16, Nothing}
-    fieldnum = findfirst(fields) do field
-        field.tag === (UInt8('B'), UInt8('C'))
+function BufferIO.consume(io::BGZFReader, n::Int)
+    @boundscheck if n % UInt > (io.buffer_filled - io.buffer_pos + 1) % UInt
+        throw(IOError(IOErrorKinds.ConsumeBufferError))
     end
-    fieldnum === nothing && return nothing
-    field = @inbounds fields[fieldnum]
-    field.data === nothing && return nothing
-    length(field.data) != 2 && return nothing
-    return (data[first(field.data)] % UInt16) | ((data[last(field.data)] % UInt16) << 8)
+    io.buffer_pos += n
+    return nothing
 end
 
-# Copy from the underlying IO into the buffer, and queue decompression,
-# for as many blocks as possible
-# Set reader.underlying_is_eof as appropriate, and set writing_block_index to
-# the first non-idle block, or whereever we reached if EOF.
-# Return whether any block was queued
-function queue!(reader::BGZFReader, ::Val{is_sync})::Bool where {is_sync}
-    blocks = reader.blocks
-    last_block_was_empty = false
+function Base.close(io::BGZFReader)
+    # Close channels to finish the workers
+    close(io.receiver)
+    close(io.sender)
+    empty!(io.sender)
+    empty!(io.result_queue)
+    empty!(io.buffer_pool)
+    io.buffer = DUMMY_BUFFER
+    close(io.io)
+    io.state = STATE_CLOSED
+    empty!(io.receiver)
+    return nothing
+end
 
-    # Sync means we only use one block
-    @assert is_sync ⊻ (length(blocks) > 1)
+Base.isopen(io::BGZFReader) = io.state != STATE_CLOSED
 
-    # We queue in a loop, and when we hit EOF we need to check if we
-    # have queued in a previous loop when exiting
-    queued_any = false
+function throw_error(io::BGZFReader, err::BGZFError)
+    io.buffer_pos = 1
+    io.buffer_filled = 0
+    io.state = STATE_ERROR
+    throw(err)
+end
 
-    while true
-        block = blocks[reader.writing_block_index]
+"""
+    seek(io::Union{BGZFReader, SyncBGZFReader}, offset::Int)
 
-        # We only queue idle blocks.
-        state = @atomic :acquire block.state
-        if !queued_any
-            # If this is the first block to queue, the block must be idle.
-            # I.e. we never call `queue!` when there can be zero blocks to queue.
-            @assert state == STATE_IDLE
+Seek to file offset `offset`. This is equivalent to seeking to `VirtualOffset(offset, 0)`.
+"""
+function Base.seek(io::BGZFReader, offset::Int)
+    io.state == STATE_CLOSED && error("Seeking on closed reader") # TODO: Proper IOError
+
+    seek(io.io, offset)
+    io.n_bytes_read = offset
+    io.current_block_offset = offset
+    io.last_was_empty = false
+    io.buffer_pos = 1
+    io.buffer_filled = 0
+    # Empty the queue. We ignore errors, and recycle any buffers
+    for result in io.result_queue
+        if result isa Tuple
+            push!(io.buffer_pool, parent(result[2]))
         end
-        state == STATE_IDLE || return queued_any
+    end
+    empty!(io.result_queue)
 
-        n_decompressed = fill_writing_block!(reader, block)
-        if isnothing(n_decompressed)
-            # This indicates EOF. Check the last block was empty - the BAM EOF marker.
-            # Note that since we skip empty blocks, this is guaranteed to occur in
-            # this same call too `queue!` in a previous loop.
-            if !reader.underlying_is_eof && reader.check_truncated && !last_block_was_empty
-                error!(reader, BGZFError(BGZFErrors.TruncatedFile))
+    # By incrementing these counters, all work currently in workers or channels
+    # is invalidated and is ignored. That logic is in `take_package!`
+    to_increment = total_buffers(length(io.workers))
+    io.n_buffers_received_or_skipped += to_increment
+    io.n_buffers_shipped_or_skipped += to_increment
+
+    # Note: Since the next outgoing package has its offset determined by `n_buffers_shipped_or_skipped`,
+    # we need to pretend we've removed these. Otherwise, the computed index will be too high in
+    # the queue.
+    io.queue_n_removed_or_skipped = io.n_buffers_shipped_or_skipped
+    io.state = STATE_OPEN
+    return io
+end
+
+function virtual_position(io::BGZFReader)
+    return VirtualOffset(io.current_block_offset, io.buffer_pos - 1)
+end
+
+function virtual_seek(io::BGZFReader, vo::VirtualOffset)
+    seek(io, vo.file_offset % Int)
+    fill_buffer(io)
+    if io.buffer_filled < vo.block_offset
+        throw(BGZFError(vo.file_offset % Int, BGZFErrors.inblock_offset_out_of_bounds))
+    end
+    io.buffer_pos += vo.block_offset
+    return io
+end
+
+function worker_loop(
+        packages::Channel{ReaderWorkPackage},
+        results::Channel{ReaderPackageResult},
+    )
+    decompressor = Decompressor()
+    for package in packages
+        block_results = Vector{Union{BGZFError, Tuple{Int, ImmutableMemoryView{UInt8}}}}()
+        buffers = Vector{Memory{UInt8}}()
+        result = ReaderPackageResult(package.buffer_offset, block_results, buffers)
+        for block_work in package.block_works
+            source = block_work.source
+            destination = block_work.destination
+            GC.@preserve source destination begin
+                libdeflate_return = unsafe_decompress!(
+                    Base.HasLength(),
+                    decompressor,
+                    pointer(destination),
+                    block_work.decompressed_len,
+                    pointer(source),
+                    length(source),
+                )
             end
-
-            # Set this such that if we continuously try to read when EOF, we don't
-            # accidentally hit the EOF check again.
-            reader.underlying_is_eof = true
-            return queued_any
-        end
-
-        if iszero(n_decompressed)
-            # Don't try to decompress empty files.
-            last_block_was_empty = true
-            continue
-        else
-            last_block_was_empty = false
-        end
-
-        # If one block, queue and return (since there are no more blocks to queue)
-        if is_sync
-            Blocks.queue_sync!(block)
-            return true
-        end
-
-        Blocks.queue!(block)
-        queued_any = true
-
-        # Move to next block to queue
-        reader.writing_block_index = next_block_index(reader, Int(reader.writing_block_index))
-    end
-    return false # unreachable
-end
-
-function read_all!(buffer::MutableMemoryView{UInt8}, io::IO)::Int
-    n_read_total = 0
-    while !isempty(buffer)
-        n_read = readbytes!(io, buffer)
-        iszero(n_read) && return n_read_total
-        n_read_total += n_read
-        buffer = @inbounds buffer[(n_read + 1):end]
-    end
-    return n_read_total
-end
-
-# Returns number of decompressed bytes, or nothing if EOF
-function fill_writing_block!(reader::BGZFReader, block::Blocks.Block{Decompressor})::Union{Nothing, Int}
-    buffer = MemoryView(block.in_data)
-    offset_at_block_start = reader.n_bytes_read
-
-    # Read in the first part of the gzip header, enough to get the gzip "extra data" length
-    n_read = read_all!(@inbounds(buffer[1:12]), reader.io)
-    reader.n_bytes_read += n_read
-    iszero(n_read) && return nothing
-    n_read == 12 || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
-
-    # Read all the extra data, where the BC field can be found
-    ex_len = (@inbounds buffer[11] % Int) | ((@inbounds buffer[12] % Int) << 8)
-    n_read = read_all!(@inbounds(buffer[13:(ex_len + 12)]), reader.io)
-    reader.n_bytes_read += n_read
-    n_read == ex_len || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
-
-    # Parse and validate the entire gzip header
-    extra_fields = reader.gzip_extra_fields
-    GC.@preserve buffer begin
-        parsed_header = unsafe_parse_gzip_header(pointer(buffer), (12 + ex_len) % UInt, extra_fields)
-    end
-
-    parsed_header isa LibDeflateError && error!(reader, BGZFError(parsed_header))
-
-    # Obtain the block size (bc) from the header - this gives the total size to read
-    # in order to queue the block.
-    fieldnum = findfirst(extra_fields) do field
-        field.tag === (UInt8('B'), UInt8('C'))
-    end
-    fieldnum === nothing && error!(reader, BGZFError(BGZFErrors.MissingBCField))
-
-    field = @inbounds extra_fields[fieldnum]
-    field.data === nothing && return error!(reader, BGZFError(BGZFErrors.MissingBCField))
-    length(field.data) != 2 && return error!(reader, BGZFError(BGZFErrors.MissingBCField))
-
-    bc = (buffer[first(field.data)] % UInt16) | ((buffer[last(field.data)] % UInt16) << 8)
-
-    # Block size is bc + 1
-    # We already read ex_len + 12 bytes
-    # So remaining is bc + 1 - ex_len - 12
-    rest_len = bc + 1 - ex_len - 12
-    n_read = read_all!(@inbounds(buffer[1:rest_len]), reader.io)
-    reader.n_bytes_read += n_read
-    n_read == rest_len || error!(reader, BGZFError(BGZFErrors.TruncatedFile))
-
-    compressed_payload_len = rest_len - 8
-    decompressed_payload_len = unsafe_bitload(UInt32, ImmutableMemoryView(buffer), rest_len - 3)
-    iszero(decompressed_payload_len) && return 0
-
-    target_crc32 = unsafe_bitload(UInt32, ImmutableMemoryView(buffer), rest_len - 7)
-    block.crc32 = target_crc32
-    block.out_len = decompressed_payload_len
-    block.in_len = compressed_payload_len
-    block.file_offset = offset_at_block_start
-
-    return decompressed_payload_len
-end
-
-function BufferIO.fill_buffer(reader::BGZFReader)::Union{Nothing, Int}
-    # Check reader state is correct
-    reader.state == STATE_CLOSED && throw(ArgumentError("Operation on closed BGZFReader"))
-    reader.state == STATE_ERROR && throw(reader.error)
-
-    blocks = reader.blocks
-    block = @inbounds blocks[reader.reading_block_index]
-
-    state = @atomic :acquire block.state
-    # State can be idle (if first call, or if repeated calls after EOF)
-    # or done.
-    # It cannot be running, because when moving the reader block to a
-    # running block, it will immediate wait.
-    # It can also not be error, because moving to an error block will propagate
-    # the error to the reader
-    if state == STATE_DONE
-        # If the block already has data, we can't fill the buffer.
-        reader.read_index ≤ block.out_len && return nothing
-
-        # Else, reset the block
-        reader.read_index = 1
-        block.out_len = 0
-        @atomic :release block.state = STATE_IDLE
-
-        # Move to the next block
-        next_index = next_block_index(reader, Int(reader.reading_block_index))
-        reader.reading_block_index = next_index
-        block = @inbounds blocks[next_index]
-        state = @atomic :acquire block.state
-    else
-        @assert state == STATE_IDLE
-    end
-
-    # If there's only one block, it's simple: Queue the block and check if it
-    # has data
-    if length(blocks) == 1
-        # If the block couldn't be queued, it must be because of EOF
-        queue!(reader, Val{true}()) || return 0
-        state == STATE_ERROR && error!(reader, BGZFError(block.error))
-        return block.out_len % Int
-    end
-
-    # If the underlying IO is EOF, we defer queuing until we run out of
-    # buffered data. This way, the underlying stream has a chance to
-    # un-EOF, if it has that option.
-    was_eof_at_first = reader.underlying_is_eof
-    was_eof_at_first || queue!(reader, Val{false}())
-
-    # It's possible the next block was queued, so wait for it and update the state
-    state = wait(block)
-
-    if state == STATE_DONE
-        @assert !iszero(block.out_len)
-        return block.out_len
-    elseif state == STATE_ERROR
-        error!(reader, BGZFError(block.error))
-    end
-
-    # If we reached this point, then we've moved the reader block into the next
-    # idle block (which is the writing block).
-    @assert state == STATE_IDLE
-    @assert reader.writing_block_index == reader.reading_block_index
-
-    # State is idle, so either...
-    if was_eof_at_first
-        # We didn't queue before. Now queue, and if none could be queued,
-        # we are EOF
-        queue!(reader, Val{false}()) || return 0
-    else
-        # Or else we did queue before, but hit EOF
-        return 0
-    end
-
-    # If we reach this point, we just queued the reading block,
-    # and possibly more blocks. Wait for the first block
-    state = wait(block)
-
-    if state == STATE_DONE
-        @assert !iszero(block.out_len)
-        return block.out_len
-    elseif state == STATE_ERROR
-        error!(reader, BGZFError(block.error))
-    else
-        @assert false # unreachable
-    end
-end
-
-function BufferIO.consume(reader::BGZFReader, n::Int)
-    reader.state == STATE_CLOSED && throw(ArgumentError("Operation on closed BGZFReader"))
-    buf = BufferIO.get_buffer(reader)
-    length(buf) < n && throw(BufferIO.IOError(BufferIO.IOErrorKinds.ConsumeBufferError))
-    reader.read_index = (reader.read_index + n) % UInt32
-    return nothing
-end
-
-#=
-mutable struct BGZFWriter{I <: IO} <: BufferIO.AbstractBufWriter
-    const io::IO
-    const blocks::Memory{Blocks.Block{Compressor}}
-
-    # Index of block next write happens to
-    index_of_block::UInt32
-
-    # Next write happens to this index of the block
-    index_in_block::UInt32
-
-    # Index of next block to flush once current write block is full.
-    flush_block_index::UInt32
-
-    write_eof_on_close::Bool
-end
-
-function BufferIO.get_buffer(io::BGZFWriter)::MutableMemoryView{UInt8}
-    block = io.blocks[io.index_of_block]
-    return MemoryView(block.in_data)[io.index_in_block:Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE]
-end
-
-function BufferIO.consume(io::BGZFWriter, n::Int)::Nothing
-    remaining = Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE = io.index_in_block + 1
-    n > remaining && error("Consumed too much")
-    io.index_in_block += n % UInt32
-    return nothing
-end
-
-function BufferIO.fill_buffer(io::BGZFWriter)::Int
-    block = io.blocks[io.index_of_block]
-    # Queue the current block
-    queue!(block)
-    io.index_in_block = 1
-
-    # If one block, wait for it to compress, then ship it out
-    if length(io.blocks) == 1
-        wait(block.task)
-        write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
-        block.in_len = 0
-    else
-        # If more, wait for any done blocks and flush them. This loop does not
-        # wait for blocks to finish.
-        while true
-            block = io.blocks[io.flush_block_index]
-            if istaskdone(block.task)
-                write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
-                block.in_len = 0
-                # If we wrote reached the block we just queued, we are done
-                should_break = io.flush_block_index == io.index_of_block
-                io.flush_block_index = next_block_index(io, io.flush_block_index % Int)
-                should_break && break
+            yield()
+            block_result = if libdeflate_return isa LibDeflateError
+                BGZFError(block_work.file_offset, libdeflate_return)
             else
-                # Else, if we need to wait, we are also done
-                break
+                GC.@preserve destination begin
+                    crc32 = unsafe_crc32(pointer(destination), block_work.decompressed_len)
+                end
+                if crc32 != block_work.expected_crc32
+                    BGZFError(block_work.file_offset, LibDeflateErrors.gzip_bad_crc32)
+                else
+                    (block_work.file_offset, ImmutableMemoryView(destination)[1:block_work.decompressed_len])
+                end
+            end
+            push!(block_results, block_result)
+            push!(buffers, parent(source))
+            if block_result isa BGZFError
+                push!(buffers, destination)
+            end
+        end
+        put!(results, result)
+    end
+    return
+end
+
+function Base.eof(io::BGZFReader)
+    # No data immediately available
+    io.buffer_pos > io.buffer_filled || return false
+
+    # No data waiting to be moved to the buffer
+    isempty(io.result_queue) || return false
+
+    # No data being processed in workers
+    io.n_buffers_shipped_or_skipped == io.n_buffers_received_or_skipped || return false
+
+    # No more data in underlying IO which can be decompressed
+    return eof(io.io)::Bool
+end
+
+function BufferIO.fill_buffer(io::BGZFReader)
+    io.state == STATE_CLOSED && return 0
+    io.state == STATE_ERROR && error("Reader is in an error state. Use `seek` or `virtual_seek` to reset it")
+
+    # Check if block has data already, we can't expand it. Return nothing.
+    io.buffer_pos > io.buffer_filled || return nothing
+
+    # Reuse buffer, except if it's the dummy buffer (which it is initialized with),
+    # or if we previously tried to fill the buffer but couldnt.
+    if !isempty(io.buffer)
+        push!(io.buffer_pool, io.buffer)
+        io.buffer = DUMMY_BUFFER
+        io.buffer_filled = 0
+        io.buffer_pos = 1
+    end
+
+    # Get results from workers, if any are ready. This allows us to 'move along'
+    # and queue more stuff more eagerly
+    if !isempty(io.receiver)
+        lock(io.receiver) do
+            while !isempty(io.receiver)
+                take_package!(io)
             end
         end
     end
 
-    # Move to next block
-    io.index_of_block = next_block_index(io, io.index_of_block % Int)
-
-    # The block we just moved to must be empty. If it isn't, we need to wait
-    # for it to finish compressing, and write it out.
-    block = io.blocks[io.index_of_block]
-    if !iszero(block.in_len)
-        wait(block.task)
-        write(io.io, ImmutableMemoryView(block.out_data)[1:block.out_len])
-        block.in_len = 0
+    # One package takes 2 * BLOCKS_PER_PACKAGE buffers. Queue all the packages we can,
+    # i.e. until we run out of buffers or until the underlying io hits EOF
+    if length(io.buffer_pool) ≥ 2 * BLOCKS_PER_PACKAGE
+        queue!(io)
     end
 
-    return Blocks.SAFE_UNCOMPRESSED_BLOCK_SIZE
+    # If any buffers are immediately available in our result queue,
+    # we move to that and return
+    if !isempty(io.result_queue)
+        n_filled = take_buffer_if_some!(io)
+        n_filled isa Int && return n_filled
+    end
+
+    # Are there any workers active? Then we wait until the next buffer is available.
+    seen_invalidated = false
+    while io.n_buffers_received_or_skipped < io.n_buffers_shipped_or_skipped
+        take_package!(io)
+
+        # This can be empty if, in take_package! we ignored the previous package
+        if isempty(io.result_queue)
+            seen_invalidated = true
+            continue
+        end
+
+        n_filled = take_buffer_if_some!(io)
+        n_filled isa Int && return n_filled
+    end
+
+    # Handle the very unlikely case where all buffers were at the workers, and invalid.
+    # If that happens, then no buffers can be queued, and no buffers can be used.
+    # We just try this function again. This can't happen twice, because after the
+    # loop above, we have all the buffers, and so can queue new work which cannot
+    # be invalid.
+    if seen_invalidated
+        return fill_buffer(io)
+    end
+
+    # No data in buffer, no workers were active, even after queuing all workers
+    # until EOF. If we reach this point, we are EOF.
+    return 0
 end
 
-function write(io::BGZFWriter, bytes::ImmutableMemoryView{UInt8})::Int
-    # Write to current write block
-    # Once block is exhausted, flush, then get next available block
+function queue!(io::BGZFReader)
+    while length(io.buffer_pool) ≥ 2 * BLOCKS_PER_PACKAGE
+        fst = get_reader_block_work(io)
+        isnothing(fst) && return nothing
+        block_works = ReaderBlockWork[fst]
+        for _ in 1:(BLOCKS_PER_PACKAGE - 1)
+            block = @something get_reader_block_work(io) break
+            push!(block_works, block)
+        end
+        package = ReaderWorkPackage(io.n_buffers_shipped_or_skipped, block_works)
+        io.n_buffers_shipped_or_skipped += length(block_works)
+        @assert !isfull(io.sender)
+        put!(io.sender, package)
+    end
+    return
 end
-=#
+
+# Take a package from the receiver (which we've verified is either not empty,
+# or a worker is busy producing a value), and move the data to the result queue
+function take_package!(io::BGZFReader)
+    result = take!(io.receiver)
+    io.n_buffers_received_or_skipped += length(result.results)
+    append!(io.buffer_pool, result.buffers)
+    index_offset = result.buffer_offset - io.queue_n_removed_or_skipped
+    # When seeking, `io.queue_n_removed_or_skipped` is incremented by a lot. This will cause the
+    # index offset of all work currently in the channels or workers to receive a negative index offset.
+    # This indicates they are invalidated. We ignore them, but recycle the buffers
+    if index_offset < 0
+        for i in eachindex(result.results)
+            res = result.results[i]
+            if !isa(res, BGZFError)
+                push!(io.buffer_pool, parent(res[2]))
+            end
+        end
+        return nothing
+    end
+    nothings_to_add = (index_offset + length(result.results) - length(io.result_queue))
+    for _ in 1:nothings_to_add
+        push!(io.result_queue, nothing)
+    end
+    for i in eachindex(result.results)
+        index = i + index_offset
+        @assert isnothing(io.result_queue[index])
+        io.result_queue[i + index_offset] = result.results[i]
+    end
+    return
+end
+
+# Take the next buffer or error from the result queue
+function take_buffer_if_some!(io::BGZFReader)::Union{Nothing, Int}
+    result = first(io.result_queue)
+    return if result isa BGZFError
+        throw_error(io, result)
+    elseif result isa Tuple{Int, ImmutableMemoryView{UInt8}}
+        (block_offset, buffer) = result
+        io.current_block_offset = block_offset
+        io.buffer = parent(buffer)
+        io.buffer_filled = last(only(parentindices(buffer)))
+        io.buffer_pos = 1
+        popfirst!(io.result_queue)
+        io.queue_n_removed_or_skipped += 1
+        length(buffer)
+    elseif result === nothing
+        nothing
+    else
+        error() # unreachable
+    end
+end
+
+
+# Read data from io.io to create work for a single block, or, if io.io is EOF,
+# return nothing
+function get_reader_block_work(io::BGZFReader)::Union{Nothing, ReaderBlockWork}
+    last_was_empty = io.check_truncated ? io.last_was_empty : nothing
+    (; consumed, result) = get_reader_block_work(io.io, io.gzip_extra_fields, last_was_empty, io.n_bytes_read)
+    io.n_bytes_read += consumed
+    if result === nothing
+        io.last_was_empty = true
+        return nothing
+    elseif result isa BGZFError
+        throw_error(io, result)
+    else
+        io.last_was_empty = false
+        source = MemoryView(pop!(io.buffer_pool))[1:length(result.payload)]
+        destination = pop!(io.buffer_pool)
+        copy!(source, result.payload)
+        consume(io.io, Int(result.block_size))
+        file_offset = io.n_bytes_read + consumed
+        io.n_bytes_read += result.block_size
+        return ReaderBlockWork(ImmutableMemoryView(source), destination, file_offset, result.expected_crc32, result.decompressed_len)
+    end
+end
+
+"""
+    SyncBGZFReader(io::T <: IO; check_truncated::Bool=true)::SyncBGZFReader{BufReader{T}}
+    SyncBGZFReader(io::T <: AbstractBufReader; check_truncated::Bool=true)::SyncBGZFReader{T}
+
+Create a `SyncBGZFReader <: AbstractBufReader` that decompresses BGZF files.
+
+When constructing from an `io::AbstractBufReader`, `io` must have a buffer size of at least
+$(MAX_BLOCK_SIZE), or be able to grow its buffer to this size.
+
+If `check_truncated`, the last BGZF block in the file must be empty, otherwise the reader
+throws an error. This can be used to detect the file was truncated.
+
+Unlike `BGZFReader`, the decompression happens in in serial in the main task.
+This is slower and does not enable paralellism, but may be preferable in situations
+where task scheduling or contention is an issue.
+
+If the reader encounters an error, it goes into an error state and throws an exception.
+The reader can be reset by using `seek` or `seekstart`. A closed reader cannot be reset.
+"""
+mutable struct SyncBGZFReader{T <: AbstractBufReader} <: AbstractBufReader
+    const io::T
+    const gzip_extra_fields::Vector{GzipExtraField}
+    const buffer::Memory{UInt8}
+    decompressor::Union{Nothing, Decompressor} # nothing when closed
+    start::Int
+    stop::Int
+    n_bytes_read::Int
+    current_block_size::UInt32
+    const check_truncated::Bool
+    last_was_empty::Bool
+    state::UInt8
+end
+
+function SyncBGZFReader(io::AbstractBufReader; check_truncated::Bool = true)
+    return SyncBGZFReader{typeof(io)}(
+        io,
+        GzipExtraField[],
+        Memory{UInt8}(undef, MAX_BLOCK_SIZE),
+        Decompressor(),
+        1,
+        0,
+        0,
+        0,
+        check_truncated,
+        false,
+        STATE_OPEN,
+    )
+end
+
+function SyncBGZFReader(io::IO; check_truncated::Bool = true)
+    bufio = BufReader(io, BUFREADER_BUFFER_SIZE)
+    return SyncBGZFReader(bufio; check_truncated)
+end
+
+BufferIO.get_buffer(io::SyncBGZFReader) = @inbounds ImmutableMemoryView(io.buffer)[io.start:io.stop]
+
+function BufferIO.consume(io::SyncBGZFReader, n::Int)
+    @boundscheck if (n % UInt) > (io.stop - io.start + 1) % UInt
+        throw(IOError(IOErrorKinds.ConsumeBufferError))
+    end
+    io.start += n
+    return nothing
+end
+
+Base.isopen(io::SyncBGZFReader) = io.state == STATE_OPEN
+
+function throw_error(io::SyncBGZFReader, err::BGZFError)
+    io.start = 1
+    io.stop = 0
+    io.state = STATE_ERROR
+    throw(err)
+end
+
+function Base.close(io::SyncBGZFReader)
+    isopen(io) || return nothing
+    io.start = 1
+    io.stop = 0
+    empty!(io.gzip_extra_fields)
+    io.decompressor = nothing
+    close(io.io)
+    io.state = STATE_CLOSED
+    return nothing
+end
+
+function BufferIO.fill_buffer(io::SyncBGZFReader)
+    io.stop > io.start && return nothing
+    isopen(io) || return 0
+    io.start = 1
+    io.stop = 0
+    last_was_empty = io.check_truncated ? nothing : io.last_was_empty
+    (; consumed, result) = get_reader_block_work(io.io, io.gzip_extra_fields, last_was_empty, io.n_bytes_read)
+    io.n_bytes_read += consumed
+    if result === nothing
+        io.last_was_empty = true
+        # An empty block is 28 bytes: 12 bytes header + 6 bytes extra data +
+        # 2 bytes for DEFLATE compression of empty payload + 8 bytes for crc32
+        # and decompressed length, both as UInt32.
+        io.current_block_size = 28
+        return 0
+    elseif result isa BGZFError
+        throw_error(io, result)
+    else
+        io.last_was_empty = false
+        (; payload, block_size, decompressed_len, expected_crc32) = result
+        io.current_block_size = block_size
+        destination = io.buffer
+        GC.@preserve payload destination begin
+            libdeflate_return = unsafe_decompress!(
+                Base.HasLength(),
+                something(io.decompressor),
+                pointer(destination),
+                decompressed_len,
+                pointer(payload),
+                length(payload),
+            )
+        end
+        if libdeflate_return isa LibDeflateError
+            throw_error(io, BGZFError(io.n_bytes_read, libdeflate_return))
+        else
+            GC.@preserve destination begin
+                crc32 = unsafe_crc32(pointer(destination), decompressed_len)
+            end
+            if crc32 != expected_crc32
+                throw_error(io, BGZFError(io.n_bytes_read, LibDeflateErrors.gzip_bad_crc32))
+            end
+        end
+        io.stop = decompressed_len
+        consume(io.io, Int(block_size))
+        io.n_bytes_read += block_size
+        return decompressed_len % Int
+    end
+end
+
+function Base.seek(io::SyncBGZFReader, offset::Int)
+    seek(io.io, offset)
+    io.stop = 0
+    io.start = 1
+    io.last_was_empty = false
+    io.n_bytes_read = offset
+    io.state = STATE_OPEN
+    return io
+end
+
+"""
+    virtual_position(io::Union{SyncBGZFReader, BGZFReader})::VirtualOffset
+
+Get the `VirtualOffset` of the current BGZF reader. The virtual offset is a
+position in the decompressed stream. Seek to the position using `virtual_seek`.
+"""
+function virtual_position(io::SyncBGZFReader)
+    return VirtualOffset(io.n_bytes_read - io.current_block_size, io.start - 1)
+end
+
+"""
+    virtual_seek(io::Union{SyncBGZFReader, BGZFReader}, vo::VirtualOffset) -> io
+
+Seek to the virtual position `vo`. The virtual position is usually obtained by
+a call to `virtual_position`.
+"""
+function virtual_seek(io::SyncBGZFReader, vo::VirtualOffset)
+    seek(io, Int(vo.file_offset % Int))
+    fill_buffer(io)
+    if io.stop < vo.block_offset
+        throw(BGZFError(vo.file_offset % Int, BGZFErrors.inblock_offset_out_of_bounds))
+    end
+    io.start += vo.block_offset
+    return io
+end
+
+function get_reader_block_work(
+        underlying::AbstractBufReader,
+        gzip_extra_fields::Vector{GzipExtraField},
+        # Nothing means: Don't check
+        last_was_empty::Union{Bool, Nothing},
+        offset_at_block_start::Int,
+    )::@NamedTuple{
+        consumed::Int,
+        result::Union{
+            BGZFError,
+            Nothing,
+            @NamedTuple{
+                payload::ImmutableMemoryView{UInt8},
+                block_size::UInt32,
+                decompressed_len::UInt32,
+                expected_crc32::UInt32,
+            },
+        }
+    }
+    # Loop while we read empty blocks
+    consumed = 0
+    while true
+        buffer = get_nonempty_buffer(underlying)
+        if isnothing(buffer)
+            if last_was_empty === false
+                return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
+            end
+            return (; consumed, result = nothing)
+        end
+
+        while length(buffer) < MAX_BLOCK_SIZE
+            increased = fill_buffer(underlying)
+            if isnothing(increased)
+                error(
+                    "BGZF reader's underlying IO has an ungrowable buffer with a size " *
+                        "smaller than 2^16 bytes. BGZF readers are only usable with `AbstractBufReaders` " *
+                        "with buffers at least 2^16 bytes long."
+                )
+            end
+            iszero(increased) && break
+            buffer = get_buffer(underlying)
+        end
+
+        # Read all the extra data, where the BC field can be found
+        # Header is 12 bytes
+        length(buffer) < 12 && return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
+        ex_len = (@inbounds buffer[11] % Int) | ((@inbounds buffer[12] % Int) << 8)
+        if length(buffer) < 12 + ex_len
+            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
+        end
+
+        # Parse and validate the entire gzip header
+        GC.@preserve buffer begin
+            parsed_header = unsafe_parse_gzip_header(pointer(buffer), (12 + ex_len) % UInt, gzip_extra_fields)
+        end
+        parsed_header isa LibDeflateError && return (; consumed, result = BGZFError(consumed, parsed_header))
+
+        # Read BC field, which gives the block size minus 1.
+        fieldnum = findfirst(gzip_extra_fields) do field
+            field.tag === (UInt8('B'), UInt8('C'))
+        end
+        fieldnum === nothing && return (; consumed, result = BGZFError(consumed, BGZFErrors.missing_bc_field))
+        field = @inbounds gzip_extra_fields[fieldnum]
+        if field.data === nothing || length(field.data) != 2
+            return (; consumed, result = BGZFError(consumed, BGZFErrors.missing_bc_field))
+        end
+        block_size = ((buffer[first(field.data)] % Int) | ((buffer[last(field.data)] % Int) << 8)) + 1
+        if length(buffer) < block_size
+            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
+        end
+        # Minimal block size: 12 header bytes, 8 trailing bytes plus ex_len
+        if block_size < ex_len + 20
+            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
+        end
+
+        # Header is 12 bytes, extra fields is ex_len, 8 for CRC and decompressed size
+        payload_span = (12 + ex_len + 1):(block_size - 8)
+        payload = ImmutableMemoryView(buffer)[payload_span]
+        decompressed_len = unsafe_bitload(UInt32, buffer, block_size - 3)
+        expected_crc32 = unsafe_bitload(UInt32, buffer, block_size - 7)
+        # Skip empty blocks, no need to decompress them
+        if iszero(decompressed_len)
+            consumed += block_size
+            offset_at_block_start += block_size
+            consume(underlying, block_size)
+            if last_was_empty === false
+                last_was_empty = true
+            end
+            continue
+        end
+        return (; consumed, result = (; payload, block_size = block_size % UInt32, decompressed_len, expected_crc32))
+    end
+    return
+end
 
 end # module BGZFLib
