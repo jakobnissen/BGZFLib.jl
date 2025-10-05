@@ -114,6 +114,7 @@ function BGZFReader(
         check_truncated::Bool = true
     )
     n_workers < 1 && throw(ArgumentError("Must have at least one worker"))
+    get_reader_source_room(io)
     sender = Channel{ReaderWorkPackage}(Inf)
     receiver = Channel{ReaderPackageResult}(Inf)
     # Each worker chunk ('package') contains 1 input and 1 output buffer per block

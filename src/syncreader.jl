@@ -32,6 +32,8 @@ mutable struct SyncBGZFReader{T <: AbstractBufReader} <: AbstractBufReader
 end
 
 function SyncBGZFReader(io::AbstractBufReader; check_truncated::Bool = true)
+    # Ensure reader can buffer a full block
+    get_reader_source_room(io)
     return SyncBGZFReader{typeof(io)}(
         io,
         GzipExtraField[],

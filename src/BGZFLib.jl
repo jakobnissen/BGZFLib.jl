@@ -16,18 +16,37 @@ using LibDeflate: Compressor,
 
 using BufferIO: BufferIO,
     AbstractBufReader,
+    AbstractBufWriter,
     BufReader,
+    BufWriter,
     IOError,
     IOErrorKinds,
     get_buffer,
     get_nonempty_buffer,
     fill_buffer,
+    shallow_flush,
+    get_unflushed,
     consume
 
-export BGZFReader, SyncBGZFReader, BGZFErrors, BGZFError, VirtualOffset, virtual_seek, virtual_position
+export BGZFReader,
+    SyncBGZFReader,
+    SyncBGZFWriter,
+    BGZFErrors,
+    BGZFError,
+    GZIndex,
+    VirtualOffset,
+    virtual_seek,
+    virtual_position,
+    write_empty_block,
+    load_index,
+    gzindex
+
 public BGZFErrorType
 
 const MAX_BLOCK_SIZE = 2^16
+
+# Compressing random data makes it larger, so only compress this many bytes.
+const SAFE_DECOMPRESSED_SIZE = MAX_BLOCK_SIZE - 256
 const DUMMY_BUFFER = Memory{UInt8}()
 
 module BGZFErrors
@@ -35,6 +54,9 @@ module BGZFErrors
         truncated_file
         missing_bc_field
         inblock_offset_out_of_bounds
+        insufficient_reader_space
+        insufficient_writer_space
+        unsorted_index
     end
 
     export BGZFErrorType
@@ -60,7 +82,7 @@ This error contains two public properties:
 struct BGZFError <: Exception
     # Block occurred in the block with this file offset (zero-based),
     # except for some errors which are not block-specific
-    block_offset::Union{Nothing, Int}
+    file_offset::Union{Nothing, Int}
     type::Union{BGZFErrorType, LibDeflateError}
 end
 
@@ -75,6 +97,28 @@ end
 function unsafe_bitstore!(v::BitInteger, data::MutableMemoryView{UInt8}, p::Integer)
     return GC.@preserve data unsafe_store!(Ptr{typeof(v)}(pointer(data, p)), htol(v))
 end
+
+const BLOCK_HEADER = [
+    0x1f, 0x8b, # Magic bytes
+    0x08, # Compression method is DEFLATE
+    0x04, # Flags: Contains extra fields
+    0x00, 0x00, 0x00, 0x00, # Modification time (mtime): Zero'd out
+    0x00, # Extra flags: None used
+    0xff, # Operating system: Unknown (we don't care about OS)
+    0x06, 0x00, # 6 bytes of extra data to follow
+    0x42, 0x43, # Xtra info tag: "BC"
+    0x02, 0x00, # 2 bytes of data for tag "BC",
+]
+
+const EOF_BLOCK = vcat(
+    BLOCK_HEADER,
+    [
+        0x1b, 0x00, # Total size of block - 1
+        0x03, 0x00, # DEFLATE compressed load of the empty input
+        0x00, 0x00, 0x00, 0x00, # CRC32 of the empty input
+        0x00, 0x00, 0x00, 0x00,  # Input size of the empty input
+    ]
+)
 
 """
 VirtualOffset(file_offset::Integer, block_offset::Integer)
@@ -117,6 +161,9 @@ function Base.getproperty(vo::VirtualOffset, s::Symbol)
     end
 end
 
+Base.:(<)(x::VirtualOffset, y::VirtualOffset) = getfield(x, :x) < getfield(y, :x)
+Base.cmp(x::VirtualOffset, y::VirtualOffset) = cmp(getfield(x, :x), getfield(y, :x))
+
 function Base.show(io::IO, x::VirtualOffset)
     return print(io, summary(x), '(', x.file_offset, ", ", x.block_offset, ')')
 end
@@ -125,8 +172,37 @@ const STATE_OPEN = 0x00
 const STATE_CLOSED = 0x01
 const STATE_ERROR = 0x02
 
+# Ensure that the sink of the BGZF writers can present a buffer of at least MAX_BLOCK_SIZE size.
+# We run this in the constructor to precallocate. This also makes the constructor error early.
+function get_writer_sink_room(io::AbstractBufWriter)::MutableMemoryView{UInt8}
+    buffer = get_buffer(io)
+    while length(buffer) < MAX_BLOCK_SIZE
+        n = grow_buffer(io)
+        iszero(n) && throw(BGZFError(nothing, BGZFErrors.insufficient_writer_space))
+        buffer = get_buffer(io)
+    end
+    return buffer
+end
+
+function get_reader_source_room(io::AbstractBufReader)::Union{Nothing, ImmutableMemoryView{UInt8}}
+    buffer = get_buffer(io)
+    while length(buffer) < MAX_BLOCK_SIZE
+        increased = fill_buffer(io)
+        if isnothing(increased)
+            throw(BGZFError(nothing, BGZFErrors.insufficient_reader_space))
+        end
+        if iszero(increased)
+            return isempty(buffer) ? nothing : buffer
+        end
+        buffer = get_buffer(io)
+    end
+    return buffer
+end
+
 include("syncreader.jl")
+include("syncwriter.jl")
 include("reader.jl")
+include("index.jl")
 
 function get_reader_block_work(
         underlying::AbstractBufReader,
@@ -150,7 +226,7 @@ function get_reader_block_work(
     # Loop while we read empty blocks
     consumed = 0
     while true
-        buffer = get_nonempty_buffer(underlying)
+        buffer = get_reader_source_room(underlying)
         if isnothing(buffer)
             if last_was_empty === false
                 return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
@@ -158,69 +234,72 @@ function get_reader_block_work(
             return (; consumed, result = nothing)
         end
 
-        while length(buffer) < MAX_BLOCK_SIZE
-            increased = fill_buffer(underlying)
-            if isnothing(increased)
-                error(
-                    "BGZF reader's underlying IO has an ungrowable buffer with a size " *
-                        "smaller than 2^16 bytes. BGZF readers are only usable with `AbstractBufReaders` " *
-                        "with buffers at least 2^16 bytes long."
-                )
+        parsed = parse_bgzf_block!(gzip_extra_fields, buffer)
+        if parsed isa LibDeflateError
+            return (; consumed, result = BGZFError(consumed, parsed))
+        elseif parsed isa BGZFErrorType
+            return (; consumed, result = BGZFError(consumed, parsed))
+        else
+            if iszero(parsed.decompressed_len)
+                consumed += parsed.block_size
+                offset_at_block_start += parsed.block_size
+                consume(underlying, Int(parsed.block_size))
+                if last_was_empty === false
+                    last_was_empty = true
+                end
+                continue
             end
-            iszero(increased) && break
-            buffer = get_buffer(underlying)
+            return (; consumed, result = parsed)
         end
-
-        # Read all the extra data, where the BC field can be found
-        # Header is 12 bytes
-        length(buffer) < 12 && return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
-        ex_len = (@inbounds buffer[11] % Int) | ((@inbounds buffer[12] % Int) << 8)
-        if length(buffer) < 12 + ex_len
-            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
-        end
-
-        # Parse and validate the entire gzip header
-        GC.@preserve buffer begin
-            parsed_header = unsafe_parse_gzip_header(pointer(buffer), (12 + ex_len) % UInt, gzip_extra_fields)
-        end
-        parsed_header isa LibDeflateError && return (; consumed, result = BGZFError(consumed, parsed_header))
-
-        # Read BC field, which gives the block size minus 1.
-        fieldnum = findfirst(gzip_extra_fields) do field
-            field.tag === (UInt8('B'), UInt8('C'))
-        end
-        fieldnum === nothing && return (; consumed, result = BGZFError(consumed, BGZFErrors.missing_bc_field))
-        field = @inbounds gzip_extra_fields[fieldnum]
-        if field.data === nothing || length(field.data) != 2
-            return (; consumed, result = BGZFError(consumed, BGZFErrors.missing_bc_field))
-        end
-        block_size = ((buffer[first(field.data)] % Int) | ((buffer[last(field.data)] % Int) << 8)) + 1
-        if length(buffer) < block_size
-            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
-        end
-        # Minimal block size: 12 header bytes, 8 trailing bytes plus ex_len
-        if block_size < ex_len + 20
-            return (; consumed, result = BGZFError(consumed, BGZFErrors.truncated_file))
-        end
-
-        # Header is 12 bytes, extra fields is ex_len, 8 for CRC and decompressed size
-        payload_span = (12 + ex_len + 1):(block_size - 8)
-        payload = ImmutableMemoryView(buffer)[payload_span]
-        decompressed_len = unsafe_bitload(UInt32, buffer, block_size - 3)
-        expected_crc32 = unsafe_bitload(UInt32, buffer, block_size - 7)
-        # Skip empty blocks, no need to decompress them
-        if iszero(decompressed_len)
-            consumed += block_size
-            offset_at_block_start += block_size
-            consume(underlying, block_size)
-            if last_was_empty === false
-                last_was_empty = true
-            end
-            continue
-        end
-        return (; consumed, result = (; payload, block_size = block_size % UInt32, decompressed_len, expected_crc32))
     end
     return
+end
+
+function parse_bgzf_block!(
+        gzip_extra_fields::Vector{GzipExtraField},
+        buffer::ImmutableMemoryView{UInt8},
+    )::Union{
+        BGZFErrorType,
+        LibDeflateError,
+        @NamedTuple{
+            payload::ImmutableMemoryView{UInt8},
+            block_size::UInt32,
+            decompressed_len::UInt32,
+            expected_crc32::UInt32,
+        },
+    }
+
+    # Read all the extra data, where the BC field can be found
+    # Header is 12 bytes
+    length(buffer) < 12 && return BGZFErrors.truncated_file
+    ex_len = (@inbounds buffer[11] % Int) | ((@inbounds buffer[12] % Int) << 8)
+    length(buffer) < 12 + ex_len && BGZFErrors.truncated_file
+
+    # Parse and validate the entire gzip header
+    GC.@preserve buffer begin
+        parsed_header = unsafe_parse_gzip_header(pointer(buffer), (12 + ex_len) % UInt, gzip_extra_fields)
+    end
+    parsed_header isa LibDeflateError && return parsed_header
+
+    # Read BC field, which gives the block size minus 1.
+    fieldnum = findfirst(gzip_extra_fields) do field
+        field.tag === (UInt8('B'), UInt8('C'))
+    end
+    fieldnum === nothing && return BGZFErrors.missing_bc_field
+    field = @inbounds gzip_extra_fields[fieldnum]
+    (field.data === nothing || length(field.data) != 2) && return BGZFErrors.missing_bc_field
+    block_size = ((buffer[first(field.data)] % Int) | ((buffer[last(field.data)] % Int) << 8)) + 1
+    length(buffer) < block_size && return BGZFErrors.truncated_file
+
+    # Minimal block size: 12 header bytes, 8 trailing bytes plus ex_len
+    block_size < ex_len + 20 && return BGZFErrors.truncated_file
+
+    # Header is 12 bytes, extra fields is ex_len, 8 for CRC and decompressed size
+    payload_span = ((12 + ex_len + 1) % UInt32):((block_size - 8) % UInt32)
+    payload = @inbounds buffer[payload_span]
+    decompressed_len = unsafe_bitload(UInt32, buffer, block_size - 3)
+    expected_crc32 = unsafe_bitload(UInt32, buffer, block_size - 7)
+    return (; payload, block_size = block_size % UInt32, decompressed_len, expected_crc32)
 end
 
 end # module BGZFLib
