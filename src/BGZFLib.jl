@@ -24,11 +24,13 @@ using BufferIO: BufferIO,
     get_buffer,
     get_nonempty_buffer,
     fill_buffer,
+    grow_buffer,
     shallow_flush,
     get_unflushed,
     consume
 
 export BGZFReader,
+    BGZFWriter,
     SyncBGZFReader,
     SyncBGZFWriter,
     BGZFErrors,
@@ -46,7 +48,8 @@ public BGZFErrorType
 const MAX_BLOCK_SIZE = 2^16
 
 # Compressing random data makes it larger, so only compress this many bytes.
-const SAFE_DECOMPRESSED_SIZE = MAX_BLOCK_SIZE - 256
+const SAFE_MARGIN = 256
+const SAFE_DECOMPRESSED_SIZE = MAX_BLOCK_SIZE - SAFE_MARGIN
 const DUMMY_BUFFER = Memory{UInt8}()
 
 module BGZFErrors
@@ -202,6 +205,7 @@ end
 include("syncreader.jl")
 include("syncwriter.jl")
 include("reader.jl")
+include("writer.jl")
 include("index.jl")
 
 function get_reader_block_work(

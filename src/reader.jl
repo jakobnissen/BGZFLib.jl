@@ -111,7 +111,7 @@ end
 function BGZFReader(
         io::AbstractBufReader;
         n_workers::Int = min(4, Threads.nthreads()),
-        check_truncated::Bool = true
+        check_truncated::Bool = true,
     )
     n_workers < 1 && throw(ArgumentError("Must have at least one worker"))
     get_reader_source_room(io)
@@ -121,7 +121,7 @@ function BGZFReader(
     pool = [Memory{UInt8}(undef, MAX_BLOCK_SIZE) for _ in 1:total_buffers(n_workers)]
     workers = Memory{Task}(undef, n_workers)
     for i in 1:n_workers
-        task = Threads.@spawn worker_loop(sender, receiver)
+        task = Threads.@spawn reader_worker_loop(sender, receiver)
         workers[i] = task
     end
     return BGZFReader{typeof(io)}(
@@ -248,7 +248,7 @@ function virtual_seek(io::BGZFReader, vo::VirtualOffset)
     return io
 end
 
-function worker_loop(
+function reader_worker_loop(
         packages::Channel{ReaderWorkPackage},
         results::Channel{ReaderPackageResult},
     )

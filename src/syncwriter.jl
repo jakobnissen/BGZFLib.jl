@@ -50,8 +50,12 @@ function BufferIO.grow_buffer(io::SyncBGZFWriter)::Int
         return n_flushed
     end
 
-    # Else, flush one block if not empy.
-    return flush_chunk(io)
+    # Else, flush all full blocks (and at least one block).
+    total_flushed = 0
+    while iszero(total_flushed) || io.n_filled - io.n_flushed ≥ SAFE_DECOMPRESSED_SIZE
+        total_flushed += flush_chunk(io)
+    end
+    return total_flushed
 end
 
 function Base.close(io::SyncBGZFWriter)
