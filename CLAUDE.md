@@ -6,7 +6,8 @@
 * See existing tests for the style and structure of the tests
 
 # Docstrings for BufferIO functions
-These should be followed by implementations in BGZFLibÆ
+These should be followed by implementations in BGZFLib.
+In particular, readers and writers in BGZFLib cannot expand their buffer.
 
 ## fill_buffer
 """

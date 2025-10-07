@@ -306,4 +306,38 @@ function parse_bgzf_block!(
     return (; payload, block_size = block_size % UInt32, decompressed_len, expected_crc32)
 end
 
+function compress_block!(
+        dst::MutableMemoryView{UInt8},
+        src::ImmutableMemoryView{UInt8},
+        compressor::Compressor,
+    )::Union{LibDeflateError, Int}
+    # Don't try to compress too large chunks, and we must have checked
+    # that destination has enough space.
+    @assert length(src) ≤ SAFE_DECOMPRESSED_SIZE
+    @assert length(dst) ≥ MAX_BLOCK_SIZE
+    GC.@preserve dst src begin
+        libdeflate_return = unsafe_compress!(
+            compressor,
+            pointer(dst) + 18,
+            length(dst) - 18,
+            pointer(src),
+            length(src),
+        )
+        crc32 = unsafe_crc32(pointer(src), length(src))
+    end
+    libdeflate_return isa LibDeflateError && return libdeflate_return
+    # Header is 12 bytes. 6 bytes for the BC field. 8 bytes for CRC and decompressed size
+    block_size = 18 + 8 + libdeflate_return
+    # Copy header over, including first 4 bytes of BC field
+    copyto!(dst, ImmutableMemoryView(BLOCK_HEADER))
+    # Copy BC value over. Note that, if length(src) ≤ SAFE_DECOMPRESSED_SIZE, block_size
+    # should never exceed typemax(UInt16), so this conversion should not error.
+    unsafe_bitstore!(UInt16(block_size - 1), dst, 17)
+    # Copy CRC32 and decompressed length
+    unsafe_bitstore!(crc32, dst, block_size - 7)
+    unsafe_bitstore!(length(src) % UInt32, dst, block_size - 3)
+    return block_size
+end
+
+
 end # module BGZFLib

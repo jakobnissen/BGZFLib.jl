@@ -204,7 +204,7 @@ end
 Seek to file offset `offset`. This is equivalent to seeking to `VirtualOffset(offset, 0)`.
 """
 function Base.seek(io::BGZFReader, offset::Int)
-    io.state == STATE_CLOSED && error("Seeking on closed reader") # TODO: Proper IOError
+    io.state == STATE_CLOSED && throw(IOError(IOErrorKinds.ClosedIO))
 
     seek(io.io, offset)
     io.n_bytes_read = offset
