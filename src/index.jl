@@ -13,13 +13,13 @@ data and the corresponding decompressed data, respectively.
 Throw a `BGZFError(nothing, BGZFErrors.unsorted_index)` if either of the offsets are not
 sorted in ascending order.
 
-Usually constructed with [`gzindex`](@ref), or [`load_index`](@ref)
+Usually constructed with [`index_bgzf`](@ref), or [`load_gzi`](@ref)
 and serialized with `write(io, ::GZIndex)`.
 
 This struct contains the public property `.blocks` which corresponds to the vector
 as described above, no matter how `GZIndex` is constructed.
 
-See also: [`gzindex`](@ref), [`load_index`](@ref), [`write_gzi`](@ref)
+See also: [`index_bgzf`](@ref), [`load_gzi`](@ref), [`write_gzi`](@ref)
 """
 struct GZIndex
     blocks::Vector{IndexBlock}
@@ -31,13 +31,13 @@ struct GZIndex
         return new(v)
     end
 
-    global function new_gzindex(v::Vector{IndexBlock})
+    global function new_index_bgzf(v::Vector{IndexBlock})
         return new(v)
     end
 end
 
-Base.write(io::AbstractBufWriter, index::GZIndex) = write_gz(io, index)
-Base.write(io::IO, index::GZIndex) = write_gz(io, index)
+Base.write(io::AbstractBufWriter, index::GZIndex) = write_gzi(io, index)
+Base.write(io::IO, index::GZIndex) = write_gzi(io, index)
 
 """
     write_gzi(io::Union{AbstractBufWriter, IO}, index::GZIndex)::Int
@@ -46,21 +46,21 @@ Write a `GZIndex` to `io` in GZI format, and return the number of written bytes.
 Currently, this function only works on little-endian CPUs, and will
 throw an `ErrorException` on big-endian platforms.
 
-The resulting file can be loaded with [`load_index`](@ref) and obtain
+The resulting file can be loaded with [`load_gzi`](@ref) and obtain
 an index equivalent to `index`.
 
-See also: [`GZIndex`](@ref), [`gzindex`](@ref)    
+See also: [`GZIndex`](@ref), [`index_bgzf`](@ref)    
 
 # Examples
 ```jldoctest
-julia> gzi = load_index(CursorReader(gzi_data))::GZIndex;
+julia> gzi = load_gzi(CursorReader(gzi_data))::GZIndex;
 
 julia> io = VecWriter();
 
 julia> write_gzi(io, gzi)
 152
 
-julia> gzi_2 = load_index(CursorReader(io.vec));
+julia> gzi_2 = load_gzi(CursorReader(io.vec));
 
 julia> gzi.blocks == gzi_2.blocks
 true
@@ -109,7 +109,7 @@ function is_sorted(blocks::ImmutableMemoryView{IndexBlock})
 end
 
 """
-    load_index(io::Union{IO, AbstractBufReader})::GZIndex
+    load_gzi(io::Union{IO, AbstractBufReader})::GZIndex
 
 Load a `GZIndex` from a GZI file.
 
@@ -119,11 +119,11 @@ sorted in ascending order.
 Currently does not throw an error if the file contains extra appended bytes, but this may
 change in the future.
 
-See also: [`gzindex`](@ref), [`GZIndex`](@ref), [`write_gzi`](@ref)
+See also: [`index_bgzf`](@ref), [`GZIndex`](@ref), [`write_gzi`](@ref)
 
 # Examples
 ```jldoctest
-julia> gzi = open(load_index, path_to_gzi);
+julia> gzi = open(load_gzi, path_to_gzi);
 
 julia> gzi isa GZIndex
 true
@@ -141,9 +141,9 @@ julia> read(reader, 15) |> String
 julia> close(reader)
 ```
 """
-load_index(io::IO) = load_index(BufReader(io))
+load_gzi(io::IO) = load_gzi(BufReader(io))
 
-function load_index(io::AbstractBufReader)
+function load_gzi(io::AbstractBufReader)
     # Load the length as a UInt64
     buffer = get_buffer_with_length(io, 8)
     buffer === nothing && throw(IOError(IOErrorKinds.EOF))
@@ -163,7 +163,7 @@ function load_index(io::AbstractBufReader)
 end
 
 """
-    gzindex(io::Union{IO, AbstractBufReader})::GZIndex
+    index_bgzf(io::Union{IO, AbstractBufReader})::GZIndex
 
 Compute a `GZIndex` from a BGZF file.
 
@@ -171,28 +171,32 @@ Throw a `BGZFError` if the BGZF file is invalid,
 or a `BGZFError` with `BGZFErrors.insufficient_reader_space` if
 an entire block cannot be buffered by `io`, (only happens if `io::AbstractBufReader`).
 
-See also: [`load_index`](@ref), [`GZIndex`](@ref), [`write_gzi`](@ref)
+Indexing the file does not attempt to decompress it, and therefore does not
+validate that the compressed data is valid (i.e. is a valid DEFLATE payload, or
+that the crc32 checksum matches).
+
+See also: [`load_gzi`](@ref), [`GZIndex`](@ref), [`write_gzi`](@ref)
 
 # Examples
 ```
-julia> idx1 = open(gzindex, path_to_bgzf);
+julia> idx1 = open(index_bgzf, path_to_bgzf);
 
-julia> idx2 = open(load_index, path_to_gzi);
+julia> idx2 = open(load_gzi, path_to_gzi);
 
 julia> idx1.blocks == idx2.blocks
 true
 ```
 """
-gzindex(io::IO) = gzindex(BufReader(io))
+index_bgzf(io::IO) = index_bgzf(BufReader(io))
 
-function gzindex(io::AbstractBufReader)
+function index_bgzf(io::AbstractBufReader)
     decompressed_offset = compressed_offset = 0
     blocks = IndexBlock[]
     gzip_fields = GzipExtraField[]
     while true
         buffer = get_reader_source_room(io)
         # Empty file is a valid BGZF file
-        isnothing(buffer) && return new_gzindex(blocks)
+        isnothing(buffer) && return new_index_bgzf(blocks)
         parsed = parse_bgzf_block!(gzip_fields, buffer)
         if parsed isa Union{BGZFErrorType, LibDeflateError}
             throw(BGZFError(compressed_offset, parsed))

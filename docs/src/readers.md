@@ -82,7 +82,7 @@ String(read(BGZFReader(reader; check_truncated = false)))
 "Hello, world!more dataxthen some moremore content herethis is another block"
 ```
 
-Like `Base.open`, the BGZF readers also ahave a method that takes a function as a first argument, and makes sure to close the reader even if it errors:
+Like `Base.open`, the BGZF readers also have a method that takes a function as a first argument, and makes sure to close the reader even if it errors:
 
 ```jldoctest
 SyncBGZFReader(io -> String(read(io)), CursorReader(bgzf_data))

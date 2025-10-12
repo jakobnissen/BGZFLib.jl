@@ -39,9 +39,9 @@ export BGZFReader,
     virtual_seek,
     virtual_position,
     write_empty_block,
-    load_index,
+    load_gzi,
     write_gzi,
-    gzindex
+    index_bgzf
 
 public BGZFErrorType
 
@@ -149,7 +149,7 @@ const EOF_BLOCK = vcat(
 )
 
 """
-VirtualOffset(file_offset::Integer, block_offset::Integer)
+    VirtualOffset(file_offset::Integer, block_offset::Integer)
 
 Create a BGZF virtual file offset from `file_offset` and `block_offset`.
 Get the two offsets with the public properties `vo.file_offset` and `vo.block_offset`

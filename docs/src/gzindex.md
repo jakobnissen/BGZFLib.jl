@@ -60,7 +60,7 @@ The approach is this:
 * Virtualseek to `VirtalOffset(D, 37 - D)`
 
 ```jldoctest
-gzi = load_index(CursorReader(gzi_data))
+gzi = load_gzi(CursorReader(gzi_data))
 reader = SyncBGZFReader(CursorReader(bgzf_data))
 
 # Use `searchsortedlast` to find the last block with a decompressed offset
@@ -79,8 +79,8 @@ read(reader) |> String
 A GZIndex can be constructed manually from a correct (and sorted) vector `v` of the above mentioned type using `GZIndex(v)`. More commonly, it is either computed from a BGZF file, or directly loaded from a GZI file:
 
 ```@docs; canonical = false
-gzindex
-load_index
+index_bgzf
+load_gzi
 ```
 
 #### Writing GZI files

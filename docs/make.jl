@@ -24,6 +24,7 @@ makedocs(;
     pages = [
         "BGZFLib" => "index.md",
         "Readers" => "readers.md",
+        "Writers" => "writers.md",
         "Seeking" => "gzindex.md",
         "Reference" => "reference.md",
     ],

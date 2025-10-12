@@ -104,6 +104,24 @@ end
     write_empty_block(io::Union{SyncBGZFWriter, BGZFWriter})
 
 Perform a shallow_flush, then write an empty block.
+
+# Examples
+Write the final empty EOF block manually:
+
+```jldoctest
+julia> io = VecWriter();
+
+julia> SyncBGZFWriter(io; append_empty=false) do writer
+           write(writer, "Hello")
+           # Manually write the empty EOF block
+           write_empty_block(writer)
+      end
+
+julia> SyncBGZFReader(CursorReader(io.vec); check_truncated=true) do reader
+           read(reader, String)
+       end
+"Hello"
+```
 """
 function write_empty_block(io::SyncBGZFWriter)
     shallow_flush(io)

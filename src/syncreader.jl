@@ -99,6 +99,8 @@ end
 Get the `VirtualOffset` of the current BGZF reader. The virtual offset is a
 position in the decompressed stream. Seek to the position using `virtual_seek`.
 
+See also: [`VirtualOffset`](@ref), [`virtual_seek`](@ref)
+
 # Examples
 ```jldoctest
 julia> reader = SyncBGZFReader(CursorReader(bgzf_data));
@@ -123,6 +125,8 @@ end
 
 Seek to the virtual position `vo`. The virtual position is usually obtained by
 a call to `virtual_position`.
+
+See also: [`VirtualOffset`](@ref), [`virtual_position`](@ref)
 
 ```jldoctest
 julia> reader = SyncBGZFReader(CursorReader(bgzf_data));
