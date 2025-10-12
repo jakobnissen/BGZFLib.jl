@@ -9,7 +9,7 @@ LibDeflate = "9255714d-24a7-4b30-8ea3-d46a97f7e13b"
 MemoryViews = "a791c907-b98b-4e44-8f4d-e4c2362c6b2f"
 
 [compat]
-BufferIO = "0.1.0"
+BufferIO = "0.2.0"
 LibDeflate = "0.4.3"
 MemoryViews = "0.3.3"
 Test = "1.11"

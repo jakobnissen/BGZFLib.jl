@@ -1,7 +1,6 @@
 module BGZFLib
 
 # TODO: Tests.
-# TODO: Writers
 
 using MemoryViews: MemoryView, ImmutableMemoryView, MutableMemoryView
 using LibDeflate: Compressor,
@@ -41,9 +40,12 @@ export BGZFReader,
     virtual_position,
     write_empty_block,
     load_index,
+    write_gzi,
     gzindex
 
 public BGZFErrorType
+
+@noinline unreachable()::Union{} = error("Unreachable statement reached, please file a bug report")
 
 const MAX_BLOCK_SIZE = 2^16
 
@@ -52,14 +54,35 @@ const SAFE_MARGIN = 256
 const SAFE_DECOMPRESSED_SIZE = MAX_BLOCK_SIZE - SAFE_MARGIN
 const DUMMY_BUFFER = Memory{UInt8}()
 
+"""
+    module BGZFErrors
+
+This module is used as a namespace for the enum `BGZFErrorType`.
+The enum is non-exhaustive (more variants may be added in the future).
+The current values are:
+
+* `truncated_file`: The reader data stops abruptly. Either in the middle of a block,
+  or there is no empty block at EOF
+* `missing_bc_field`: A block has no `BC` field, or it's malformed
+* `block_offset_out_of_bounds`: Seek with a `VirtualOffset` where the block offset
+  is larger than the block size
+* `insufficient_reader_space`: The BGZF reader wraps an `AbstractBufWriter` that is
+  not EOF, and its buffer can't grow to encompass a whole BGZF block
+* `insufficient_writer_space`: A BGZF writer wraps an `AbstractBufWriter` whose buffer
+  cannot grow to encompass a full BGZF block
+* `unsorted_index`: Attempted to load a malformed GZI file with unsorted coordinates
+* `operation_on_error`: Attempted an operation on a BGZF reader or writer in an
+  error state.
+"""
 module BGZFErrors
     @enum BGZFErrorType::UInt8 begin
         truncated_file
         missing_bc_field
-        inblock_offset_out_of_bounds
+        block_offset_out_of_bounds
         insufficient_reader_space
         insufficient_writer_space
         unsorted_index
+        operation_on_error
     end
 
     export BGZFErrorType
@@ -88,6 +111,8 @@ struct BGZFError <: Exception
     file_offset::Union{Nothing, Int}
     type::Union{BGZFErrorType, LibDeflateError}
 end
+
+# TODO: Show method. Give hint if operation_on_error
 
 const BitInteger = Union{UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64}
 
@@ -135,6 +160,24 @@ the block with the given position, and an "block offset" which is the
 offset of the *uncompressed* content of that block.
 
 The valid ranges of these two are `0:2^48-1` and `0:2^16-1`, respectively.
+
+# Examples
+```jldoctest
+julia> reader = SyncBGZFReader(CursorReader(bgzf_data));
+
+julia> vo = VirtualOffset(178, 5)
+VirtualOffset(178, 5)
+
+julia> virtual_seek(reader, vo);
+
+julia> String(read(reader, 9))
+"some more"
+
+julia> virtual_seek(reader, VirtualOffset(0, 7));
+
+julia> String(read(reader, 6))
+"world!"
+```
 """
 struct VirtualOffset
     x::UInt64

@@ -146,6 +146,15 @@ function BGZFReader(
     )
 end
 
+function BGZFReader(f, args...; kwargs...)
+    reader = BGZFReader(args...; kwargs...)
+    return try
+        f(reader)
+    finally
+        close(reader)
+    end
+end
+
 # I don't quite understand why, but adding some extra buffers makes the workers wait less and speeds
 # up the code. It costs about 256 KiB memory per extra buffering, so we add it sparingly.
 extra_buffering(n_workers::Int) = min(4, cld(n_workers, 2))
@@ -189,7 +198,6 @@ function Base.close(io::BGZFReader)
 end
 
 Base.isopen(io::BGZFReader) = io.state != STATE_CLOSED
-
 
 function throw_error(io::BGZFReader, err::BGZFError)
     io.buffer_pos = 1
@@ -242,7 +250,7 @@ function virtual_seek(io::BGZFReader, vo::VirtualOffset)
     seek(io, vo.file_offset % Int)
     fill_buffer(io)
     if io.buffer_filled < vo.block_offset
-        throw(BGZFError(vo.file_offset % Int, BGZFErrors.inblock_offset_out_of_bounds))
+        throw(BGZFError(vo.file_offset % Int, BGZFErrors.block_offset_out_of_bounds))
     end
     io.buffer_pos += vo.block_offset
     return io
@@ -270,7 +278,8 @@ function reader_worker_loop(
                     length(source),
                 )
             end
-            yield()
+            # For some reason, having this yield here absolutely tanks performance.
+            # yield()
             block_result = if libdeflate_return isa LibDeflateError
                 BGZFError(block_work.file_offset, libdeflate_return)
             else
@@ -310,7 +319,7 @@ end
 
 function BufferIO.fill_buffer(io::BGZFReader)
     io.state == STATE_CLOSED && return 0
-    io.state == STATE_ERROR && error("Reader is in an error state. Use `seek` or `virtual_seek` to reset it")
+    io.state == STATE_ERROR && throw(BGZFError(nothing, BGZFErrors.operation_on_error))
 
     # Check if block has data already, we can't expand it. Return nothing.
     io.buffer_pos > io.buffer_filled || return nothing

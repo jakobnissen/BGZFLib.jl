@@ -1,7 +1,7 @@
 using BGZFLib
 using Test
 using MemoryViews
-using BufferIO: consume, fill_buffer, get_buffer, CursorReader, BufReader, IOError
+using BufferIO: consume, fill_buffer, get_buffer, CursorReader, BufReader, IOError, VecWriter, BufWriter
 
 DIR = joinpath(dirname(dirname(pathof(BGZFLib))), "data")
 
@@ -24,10 +24,11 @@ gz1_content = [
     include("syncreader.jl")
 end
 
+@testset "SyncBGZFWriter" begin
+    include("syncwriter.jl")
+end
+
+
 @testset "BGZFReader" begin
     include("reader.jl")
 end
-
-# TODO:
-# * No EOF block check
-# * Empty input

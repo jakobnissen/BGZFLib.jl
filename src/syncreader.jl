@@ -54,6 +54,15 @@ function SyncBGZFReader(io::IO; check_truncated::Bool = true)
     return SyncBGZFReader(bufio; check_truncated)
 end
 
+function SyncBGZFReader(f, args...; kwargs...)
+    reader = SyncBGZFReader(args...; kwargs...)
+    return try
+        f(reader)
+    finally
+        close(reader)
+    end
+end
+
 BufferIO.get_buffer(io::SyncBGZFReader) = @inbounds ImmutableMemoryView(io.buffer)[io.start:io.stop]
 
 function BufferIO.consume(io::SyncBGZFReader, n::Int)
@@ -89,6 +98,21 @@ end
 
 Get the `VirtualOffset` of the current BGZF reader. The virtual offset is a
 position in the decompressed stream. Seek to the position using `virtual_seek`.
+
+# Examples
+```jldoctest
+julia> reader = SyncBGZFReader(CursorReader(bgzf_data));
+
+julia> virtual_position(reader)
+VirtualOffset(0, 0)
+
+julia> read(reader, 18);
+
+julia> virtual_position(reader)
+VirtualOffset(44, 5)
+
+julia> close(reader)
+```
 """
 function virtual_position(io::SyncBGZFReader)
     return VirtualOffset(io.n_bytes_read - io.current_block_size, io.start - 1)
@@ -99,17 +123,59 @@ end
 
 Seek to the virtual position `vo`. The virtual position is usually obtained by
 a call to `virtual_position`.
+
+```jldoctest
+julia> reader = SyncBGZFReader(CursorReader(bgzf_data));
+
+julia> virtual_seek(reader, VirtualOffset(178, 14));
+
+julia> String(read(reader))
+"more content herethis is another block"
+
+julia> virtual_seek(reader, VirtualOffset(0, 0));
+
+julia> String(read(reader, 13))
+"Hello, world!"
+
+julia> close(reader)
+```
 """
 function virtual_seek(io::SyncBGZFReader, vo::VirtualOffset)
     seek(io, Int(vo.file_offset % Int))
     fill_buffer(io)
     if io.stop < vo.block_offset
-        throw(BGZFError(vo.file_offset % Int, BGZFErrors.inblock_offset_out_of_bounds))
+        throw(BGZFError(vo.file_offset % Int, BGZFErrors.block_offset_out_of_bounds))
     end
     io.start += vo.block_offset
     return io
 end
 
+"""
+    seek(io::Union{SyncBGZFReader, BGZFReader}, offset::Int)
+
+Seek to the zero-indexed position in the *compressed stream* `offset`. This position
+must be the beginning of a BGZF block, else the reader will error when trying to read
+after the seek.
+`seek(io, offset)` is equivalent to `seek(io, VirtualOffset(offset, 0))`.
+`seek(io, 0)` works, and is equivalent to `seekstart(io)`.
+
+# Examples
+```jldoctest
+julia> reader = BGZFReader(CursorReader(bgzf_data));
+
+julia> seek(reader, 44);
+
+julia> read(reader, String)
+"more dataxthen some moremore content herethis is another block"
+
+julia> seek(reader, 45); # NB: Not start of BGZF block
+
+julia> read(reader, UInt8)
+ERROR: BGZFError(0, LibDeflate.LibDeflateErrors.gzip_bad_magic_bytes)
+
+julia> close(reader)
+```
+"""
 function Base.seek(io::SyncBGZFReader, offset::Int)
     seek(io.io, offset)
     io.stop = 0
@@ -122,7 +188,7 @@ end
 
 function BufferIO.fill_buffer(io::SyncBGZFReader)
     io.state == STATE_CLOSED && return 0
-    io.state == STATE_ERROR && error("Reader is in an error state. Use `seek` or `virtual_seek` to reset it")
+    io.state == STATE_ERROR && throw(BGZFError(nothing, BGZFErrors.operation_on_error))
 
     io.stop > io.start && return nothing
     io.start = 1

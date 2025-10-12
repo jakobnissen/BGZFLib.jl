@@ -41,6 +41,15 @@ function SyncBGZFWriter(io::IO; append_empty::Bool = true, compresslevel::Int = 
     return SyncBGZFWriter(buf; append_empty, compresslevel)
 end
 
+function SyncBGZFWriter(f, args...; kwargs...)
+    reader = SyncBGZFWriter(args...; kwargs...)
+    return try
+        f(reader)
+    finally
+        close(reader)
+    end
+end
+
 BufferIO.get_buffer(io::SyncBGZFWriter) = MemoryView(io.buffer)[(io.n_filled + 1):end]
 BufferIO.get_unflushed(io::SyncBGZFWriter) = MemoryView(io.buffer)[1:io.n_filled]
 
@@ -82,7 +91,7 @@ function compress_and_flush_buffer(io::SyncBGZFWriter)::Int
     isempty(src) && return 0
     @assert length(src) ≤ SAFE_DECOMPRESSED_SIZE
     dst = get_writer_sink_room(io.io)
-    compress_result = compress_block!(dst, src, something(io.compressor))
+    compress_result = compress_block!(dst, ImmutableMemoryView(src), something(io.compressor))
     if compress_result isa LibDeflateError
         throw(BGZFError(nothing, compress_result))
     end
