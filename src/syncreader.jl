@@ -64,6 +64,13 @@ function SyncBGZFReader(f, io::Union{AbstractBufReader, IO}; kwargs...)
     end
 end
 
+function Base.show(io::IO, reader::SyncBGZFReader)
+    summary(io, reader)
+    print(io, '(')
+    show(io, reader.io)
+    return print(io, ')')
+end
+
 BufferIO.get_buffer(io::SyncBGZFReader) = @inbounds ImmutableMemoryView(io.buffer)[io.start:io.stop]
 
 function BufferIO.consume(io::SyncBGZFReader, n::Int)

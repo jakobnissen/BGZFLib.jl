@@ -16,7 +16,7 @@ struct WriterResult
     unused::Memory{UInt8}
     # Eiher an error, and a buffer that can be recycled. Else, a view that should
     # be written to the underlying IO, after which it can be recycled.
-    result::Union{ImmutableMemoryView{UInt8}, Tuple{BGZFError, Memory{UInt8}}}
+    result::ImmutableMemoryView{UInt8}
 end
 
 """
@@ -51,7 +51,7 @@ mutable struct BGZFWriter{T <: AbstractBufWriter} <: AbstractBufWriter
     # FIFO queue - we take results from the receiver and add it here. Then, we popfirst
     # all finished results and flush them to io.io.
     # nothing means result is still at worker.
-    const result_queue::Vector{Union{Nothing, ImmutableMemoryView{UInt8}, BGZFError}}
+    const result_queue::Vector{Union{Nothing, ImmutableMemoryView{UInt8}}}
     const sender::Channel{WriterWork}
     const receiver::Channel{WriterResult}
     const workers::Memory{Task}
@@ -98,7 +98,7 @@ function BGZFWriter(
     return BGZFWriter{typeof(io)}(
         io,
         pool,
-        Vector{Union{Nothing, ImmutableMemoryView{UInt8}, BGZFError}}(),
+        Vector{Union{Nothing, ImmutableMemoryView{UInt8}}}(),
         sender,
         receiver,
         workers,
@@ -159,12 +159,6 @@ end
 
 function check_open(io::BGZFWriter)
     return isopen(io) || throw(IOError(IOErrorKinds.ClosedIO))
-end
-
-function throw_error(io::BGZFWriter, err::BGZFError)
-    io.consumed = length(io.buffer)
-    io.state = STATE_ERROR
-    throw(err)
 end
 
 # Not the same as BufferIO.shallow_flush, because we don't return
@@ -267,15 +261,6 @@ function take_result(io::BGZFWriter)
     result = take!(io.receiver)
     io.n_received += 1
     push!(io.buffer_pool, result.unused)
-    # We simply push the error to the result queue, to defer erroring
-    # until we actually hit the block that errored.
-    value = if result.result isa Tuple
-        (error, buffer) = result.result
-        push!(io.buffer_pool, buffer)
-        error
-    else
-        result.result
-    end
     # We popfirst'ed io.n_removed times from the queue, so therefore result number N
     # is at index N - io.n_removed.
     index = result.work_index - io.n_removed
@@ -286,7 +271,7 @@ function take_result(io::BGZFWriter)
     end
     # We can't receive the same package twice
     @assert isnothing(io.result_queue[index])
-    io.result_queue[index] = value
+    io.result_queue[index] = result.result
     return nothing
 end
 
@@ -299,12 +284,8 @@ function flush_next_result_queue(io::BGZFWriter)::Int
     while !isempty(io.result_queue) && !isnothing(first(io.result_queue))
         fst = popfirst!(io.result_queue)
         io.n_removed += 1
-        if fst isa BGZFError
-            throw_error(io, fst)
-        else
-            n_flushed += write(io.io, fst)
-            push!(io.buffer_pool, parent(fst))
-        end
+        n_flushed += write(io.io, fst)
+        push!(io.buffer_pool, parent(fst))
     end
     return n_flushed
 end
@@ -316,27 +297,16 @@ function writer_worker_loop(
     )
     compressor = Compressor(compress_level)
     for work in work_channel
-        has_errored = false
         n_written = 0
         @assert length(work.uncompressed) ≤ WRITER_BLOCKS * SAFE_DECOMPRESSED_SIZE
         for src in Iterators.partition(work.uncompressed, SAFE_DECOMPRESSED_SIZE)
             dst = MemoryView(work.destination)[(n_written + 1):end]
             block_size = compress_block!(dst, src, compressor)
+            # Note: This yield slows down the code too much - we can't yield
+            # at every block. Instead, we rely on our channels to yield for us.
             # yield()
-            if block_size isa LibDeflateError
-                error = BGZFError(nothing, block_size)
-                result = WriterResult(
-                    work.work_index,
-                    parent(work.uncompressed),
-                    (error, work.destination),
-                )
-                put!(result_channel, result)
-                has_errored = true
-                break
-            end
             n_written += block_size
         end
-        has_errored && continue
         result = WriterResult(
             work.work_index,
             parent(work.uncompressed),

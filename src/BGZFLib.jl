@@ -353,22 +353,22 @@ function compress_block!(
         dst::MutableMemoryView{UInt8},
         src::ImmutableMemoryView{UInt8},
         compressor::Compressor,
-    )::Union{LibDeflateError, Int}
+    )::Int
     # Don't try to compress too large chunks, and we must have checked
     # that destination has enough space.
     @assert length(src) ≤ SAFE_DECOMPRESSED_SIZE
     @assert length(dst) ≥ MAX_BLOCK_SIZE
     GC.@preserve dst src begin
+        # Note: This should never be able to error, so we typeassert here
         libdeflate_return = unsafe_compress!(
             compressor,
             pointer(dst) + 18,
             length(dst) - 18,
             pointer(src),
             length(src),
-        )
+        )::Int
         crc32 = unsafe_crc32(pointer(src), length(src))
     end
-    libdeflate_return isa LibDeflateError && return libdeflate_return
     # Header is 12 bytes. 6 bytes for the BC field. 8 bytes for CRC and decompressed size
     block_size = 18 + 8 + libdeflate_return
     # Copy header over, including first 4 bytes of BC field

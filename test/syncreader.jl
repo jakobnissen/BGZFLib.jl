@@ -237,3 +237,11 @@ end
     seekstart(reader)
     @test read(reader, 10) == b"Hello, wor"
 end
+
+@testset "show" begin
+    # We just test that showing doesn't error
+    buf = IOBuffer()
+    reader = SyncBGZFReader(CursorReader(UInt8[]))
+    show(buf, reader)
+    @test !isempty(take!(buf))
+end

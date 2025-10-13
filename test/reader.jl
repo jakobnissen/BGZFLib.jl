@@ -203,3 +203,8 @@ end
     @test !isopen(io)
     @test result == b"more dataxthen some moremore content herethis is another block"
 end
+
+@testset "show" begin
+    # We just test that showing doesn't error
+
+end

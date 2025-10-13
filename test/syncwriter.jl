@@ -111,3 +111,11 @@ end
     @test read(reader) == b"Hello, world!"
     close(reader)
 end
+
+@testset "show" begin
+    # We just test that showing doesn't error
+    buf = IOBuffer()
+    writer = SyncBGZFWriter(VecWriter())
+    show(buf, writer)
+    @test !isempty(take!(buf))
+end
