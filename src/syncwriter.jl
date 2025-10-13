@@ -115,7 +115,7 @@ julia> SyncBGZFWriter(io; append_empty=false) do writer
            write(writer, "Hello")
            # Manually write the empty EOF block
            write_empty_block(writer)
-      end
+       end
 
 julia> SyncBGZFReader(CursorReader(io.vec); check_truncated=true) do reader
            read(reader, String)
