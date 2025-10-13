@@ -146,3 +146,42 @@ end
     @test result == 18
     @test String(bgzfread(io)) == "function form test"
 end
+
+@testset "Large write spanning multiple blocks" begin
+    @testset "Single large write" begin
+        io = VecWriter()
+        writer = BGZFWriter(io; n_workers = 4)
+
+        # Create data larger than SAFE_DECOMPRESSED_SIZE to span multiple blocks
+        # SAFE_DECOMPRESSED_SIZE is 2^16 - 256 = 65280 bytes
+        data = repeat(b"0123456789", 10000)  # 100000 bytes
+        @test length(data) > 65280
+
+        @test write(writer, data) == length(data)
+        close(writer)
+
+        reader = SyncBGZFReader(CursorReader(io.vec))
+        @test read(reader) == data
+        close(reader)
+    end
+
+    @testset "Multiple writes accumulating to large data" begin
+        io = VecWriter()
+        writer = BGZFWriter(io; n_workers = 2)
+
+        chunk = repeat(b"abcdefghij", 1000)  # 10000 bytes per chunk
+        total_written = 0
+
+        for i in 1:10
+            total_written += write(writer, chunk)
+        end
+
+        @test total_written == 100000
+        close(writer)
+
+        expected_data = repeat(chunk, 10)
+        reader = SyncBGZFReader(CursorReader(io.vec))
+        @test read(reader) == expected_data
+        close(reader)
+    end
+end
