@@ -316,27 +316,16 @@ function writer_worker_loop(
     )
     compressor = Compressor(compress_level)
     for work in work_channel
-        has_errored = false
         n_written = 0
         @assert length(work.uncompressed) ≤ WRITER_BLOCKS * SAFE_DECOMPRESSED_SIZE
         for src in Iterators.partition(work.uncompressed, SAFE_DECOMPRESSED_SIZE)
             dst = MemoryView(work.destination)[(n_written + 1):end]
             block_size = compress_block!(dst, src, compressor)
+            # Note: This yield slows down the code too much - we can't yield
+            # at every block. Instead, we rely on our channels to yield for us.
             # yield()
-            if block_size isa LibDeflateError
-                error = BGZFError(nothing, block_size)
-                result = WriterResult(
-                    work.work_index,
-                    parent(work.uncompressed),
-                    (error, work.destination),
-                )
-                put!(result_channel, result)
-                has_errored = true
-                break
-            end
             n_written += block_size
         end
-        has_errored && continue
         result = WriterResult(
             work.work_index,
             parent(work.uncompressed),
