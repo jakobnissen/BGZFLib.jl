@@ -54,8 +54,9 @@ function SyncBGZFReader(io::IO; check_truncated::Bool = true)
     return SyncBGZFReader(bufio; check_truncated)
 end
 
-function SyncBGZFReader(f, args...; kwargs...)
-    reader = SyncBGZFReader(args...; kwargs...)
+function SyncBGZFReader(f, io::Union{AbstractBufReader, IO}; kwargs...)
+    reader = SyncBGZFReader(io; kwargs...)
+    reader = SyncBGZFReader(io, ; kwargs...)
     return try
         f(reader)
     finally
@@ -197,7 +198,7 @@ function BufferIO.fill_buffer(io::SyncBGZFReader)
     io.stop > io.start && return nothing
     io.start = 1
     io.stop = 0
-    last_was_empty = io.check_truncated ? nothing : io.last_was_empty
+    last_was_empty = io.check_truncated ? io.last_was_empty : nothing
     (; consumed, result) = get_reader_block_work(io.io, io.gzip_extra_fields, last_was_empty, io.n_bytes_read)
     io.n_bytes_read += consumed
     if result === nothing

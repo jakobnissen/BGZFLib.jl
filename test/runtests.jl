@@ -28,7 +28,10 @@ end
     include("syncwriter.jl")
 end
 
-
 @testset "BGZFReader" begin
     include("reader.jl")
+end
+
+@testset "BGZFWriter" begin
+    include("writer.jl")
 end

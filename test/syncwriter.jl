@@ -18,6 +18,7 @@ end
     flush(writer)
     seekstart(io)
     data = read(io)
+    append!(data, BGZFLib.EOF_BLOCK)
     close(writer)
     reader = SyncBGZFReader(CursorReader(data))
     @test read(reader) == b"test data"

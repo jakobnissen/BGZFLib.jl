@@ -124,12 +124,12 @@ function BGZFWriter(
     return BGZFWriter(bufio; n_workers, append_empty, compress_level)
 end
 
-function BGZFWriter(f, args...; kwargs...)
-    reader = BGZFWriter(args...; kwargs...)
+function BGZFWriter(f, io::Union{AbstractBufWriter, IO}; kwargs...)
+    writer = BGZFWriter(io; kwargs...)
     return try
-        f(reader)
+        f(writer)
     finally
-        close(reader)
+        close(writer)
     end
 end
 
