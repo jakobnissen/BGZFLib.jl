@@ -1,5 +1,6 @@
 # BGZFLib.jl
-[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://biojulia.dev/BGZFLib.jl/dev/)
+[![Stable docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://biojulia.dev/BGZFLib.jl/stable/)
+[![Dev docs](https://img.shields.io/badge/docs-latest-blue.svg)](https://biojulia.dev/BGZFLib.jl/dev/)
 [![Latest Release](https://img.shields.io/github/release/BioJulia/BGZFLib.jl.svg)](https://github.com/BioJulia/BGZFLib.jl/releases/latest)
 [![](https://codecov.io/gh/BioJulia/BGZFLib.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/BioJulia/BGZFLib.jl)
 
