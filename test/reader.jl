@@ -190,3 +190,16 @@ end
         close(reader)
     end
 end
+
+@testset "Function argument constructor" begin
+    io = IOBuffer(gz1_data)
+    result = BGZFReader(io; n_workers = 2) do reader
+        @test isopen(reader)
+        @test read(reader, 5) == b"Hello"
+        @test read(reader, 8) == b", world!"
+        read(reader)
+    end
+
+    @test !isopen(io)
+    @test result == b"more dataxthen some moremore content herethis is another block"
+end

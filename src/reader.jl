@@ -168,8 +168,8 @@ function BGZFReader(
     )
 end
 
-function BGZFReader(f, args...; kwargs...)
-    reader = BGZFReader(args...; kwargs...)
+function BGZFReader(f, io::Union{AbstractBufReader, IO}; kwargs...)
+    reader = BGZFReader(io; kwargs...)
     return try
         f(reader)
     finally

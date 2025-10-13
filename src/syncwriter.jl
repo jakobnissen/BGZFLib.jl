@@ -41,12 +41,12 @@ function SyncBGZFWriter(io::IO; append_empty::Bool = true, compresslevel::Int = 
     return SyncBGZFWriter(buf; append_empty, compresslevel)
 end
 
-function SyncBGZFWriter(f, args...; kwargs...)
-    reader = SyncBGZFWriter(args...; kwargs...)
+function SyncBGZFWriter(f, io::Union{AbstractBufWriter, IO}; kwargs...)
+    writer = SyncBGZFWriter(io; kwargs...)
     return try
-        f(reader)
+        f(writer)
     finally
-        close(reader)
+        close(writer)
     end
 end
 
