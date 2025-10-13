@@ -48,10 +48,11 @@ If the reader encounters an error, it goes into an error state and throws an exc
 The reader can be reset by using `seek` or `seekstart`. A closed reader cannot be reset.
 """
 mutable struct BGZFReader{T <: AbstractBufReader} <: AbstractBufReader
-    # This needs to have at least 2^16 bytes buffersize.
+    # This needs to have at least 2^16 bytes buffersize. Checked in constructor.
     const io::T
 
     # Cached so the main task does not have to allocate a new vector all the time
+    # when parsing a BGZF block (which is a valid gzip file)
     const gzip_extra_fields::Vector{GzipExtraField}
 
     # Buffers can be: in the `io.buffer` field, in workers, in either of the two channels,
@@ -65,16 +66,23 @@ mutable struct BGZFReader{T <: AbstractBufReader} <: AbstractBufReader
     # packages 1 and 3, then index 2 is nothing.
     # A non-error result is (file_offset of block, decompressed block)
     const result_queue::Vector{Union{Nothing, BGZFError, Tuple{Int, ImmutableMemoryView{UInt8}}}}
+
+    # We the main task sends work to workers using `sender` and receives results from `receiver`
     const sender::Channel{ReaderWorkPackage}
     const receiver::Channel{ReaderPackageResult}
     const workers::Memory{Task}
 
     # Buffers popped off the result queue (using popfirst!) and go here.
+    # This buffer is the one ultimately given to the user.
     # After it is used up, its parent is recycled and goes to the buffer pool.
     # It's initialized with an empty memory which is discarded, not recycled
     buffer::Memory{UInt8}
-    buffer_pos::Int
-    buffer_filled::Int
+
+    # Bytes [1 : consumed] have been consumed from .buffer
+    # Bytes [(consumed + 1) : filled] are ready to read
+    # Bytes [filled + 1 : end] are uninitialized
+    consumed::Int
+    filled::Int
 
     # This is essentially only used for `position(io)`. It gives the offset in the compressed file
     # of the current active buffer
@@ -83,13 +91,15 @@ mutable struct BGZFReader{T <: AbstractBufReader} <: AbstractBufReader
     # We keep track of the number of buffers we've shipped to workers, and how many we've
     # received from workers. This has three purposes:
     # First, each work package contains the buffer offset (i.e. buffers shipped before this one),
-    # so that received work can be ordered correctly.
+    # so that received work can be ordered correctly in `result_queue`.
     # Second, we can check if there are any data in the workers or the channels by comparing
     # these two numbers. This tells us e.g. if we're really EOF, and whether we can safely wait
     # for more data from workers without deadlocking.
     # Third, it allows us to invalidate results from workers when skipping or seeking.
     # If we increment these counters and also `queue_n_removed` by a lot, then any data from workers
     # will have a negative index in the queue. This signals the data is invalid and can be discarded.
+    # We do this because, after seeking, any data in the workers are from before the seek, and should
+    # therefore not be presented to the user.
     n_buffers_shipped_or_skipped::Int
     n_buffers_received_or_skipped::Int
 
@@ -105,6 +115,17 @@ mutable struct BGZFReader{T <: AbstractBufReader} <: AbstractBufReader
     # Error if EOF is reached and last block was not empty. This is a BGZF feature.
     check_truncated::Bool
     last_was_empty::Bool
+
+    # This marks whether we've seen the underlying IO is EOF. If it is, then we do not attempt
+    # to parse new BGZF blocks.
+    # When the reader runs out of blocks, then we try to read the underlying again, even if
+    # this flag is set, in case the underlying has gotten more data in the meanwhile.
+    # We also set this flag if a block cannot be parsed. In that case, we thus force the reader
+    # to go through all its existing results, including the BGZFError, which is then triggered,
+    # before tries to parse blocks beyond the malformed one.
+    # This way, errors from parsing blocks in advance are deferred until the reader actually
+    # tries to read the block.
+    underlying_is_eof_or_malformed::Bool
     state::UInt8 # open, closed or error
 end
 
@@ -133,14 +154,15 @@ function BGZFReader(
         receiver,
         workers,
         DUMMY_BUFFER,
-        1, # pos
-        0, # buffer filled
+        0, # consumed
+        0, # filled
         0, # block offset
         0, # packages shipped
         0, # packages received
         0, # buffers consumed
         0, # bytes read
         check_truncated,
+        false,
         false,
         STATE_OPEN,
     )
@@ -173,13 +195,13 @@ function BGZFReader(
     return BGZFReader(bufio; n_workers, check_truncated)
 end
 
-BufferIO.get_buffer(io::BGZFReader) = ImmutableMemoryView(io.buffer)[io.buffer_pos:io.buffer_filled]
+BufferIO.get_buffer(io::BGZFReader) = ImmutableMemoryView(io.buffer)[(io.consumed + 1):io.filled]
 
 function BufferIO.consume(io::BGZFReader, n::Int)
-    @boundscheck if n % UInt > (io.buffer_filled - io.buffer_pos + 1) % UInt
+    @boundscheck if n % UInt > (io.filled - io.consumed) % UInt
         throw(IOError(IOErrorKinds.ConsumeBufferError))
     end
-    io.buffer_pos += n
+    io.consumed += n
     return nothing
 end
 
@@ -191,6 +213,7 @@ function Base.close(io::BGZFReader)
     empty!(io.result_queue)
     empty!(io.buffer_pool)
     io.buffer = DUMMY_BUFFER
+    io.underlying_is_eof_or_malformed = true
     close(io.io)
     io.state = STATE_CLOSED
     empty!(io.receiver)
@@ -200,8 +223,8 @@ end
 Base.isopen(io::BGZFReader) = io.state != STATE_CLOSED
 
 function throw_error(io::BGZFReader, err::BGZFError)
-    io.buffer_pos = 1
-    io.buffer_filled = 0
+    io.consumed = 0
+    io.filled = 0
     io.state = STATE_ERROR
     throw(err)
 end
@@ -218,8 +241,9 @@ function Base.seek(io::BGZFReader, offset::Int)
     io.n_bytes_read = offset
     io.current_block_offset = offset
     io.last_was_empty = false
-    io.buffer_pos = 1
-    io.buffer_filled = 0
+    io.underlying_is_eof_or_malformed = false
+    io.consumed = 0
+    io.filled = 0
     # Empty the queue. We ignore errors, and recycle any buffers
     for result in io.result_queue
         if result isa Tuple
@@ -243,17 +267,24 @@ function Base.seek(io::BGZFReader, offset::Int)
 end
 
 function virtual_position(io::BGZFReader)
-    return VirtualOffset(io.current_block_offset, io.buffer_pos - 1)
+    return VirtualOffset(io.current_block_offset, io.consumed)
 end
 
 function virtual_seek(io::BGZFReader, vo::VirtualOffset)
     seek(io, vo.file_offset % Int)
     fill_buffer(io)
-    if io.buffer_filled < vo.block_offset
+    if io.filled < vo.block_offset
         throw(BGZFError(vo.file_offset % Int, BGZFErrors.block_offset_out_of_bounds))
     end
-    io.buffer_pos += vo.block_offset
+    io.consumed += vo.block_offset
     return io
+end
+
+function Base.show(io::IO, reader::BGZFReader)
+    summary(io, reader)
+    print(io, '(')
+    show(io, reader.io)
+    return print(io, ')')
 end
 
 function reader_worker_loop(
@@ -304,8 +335,12 @@ function reader_worker_loop(
 end
 
 function Base.eof(io::BGZFReader)
+    # Note: We don't check io.underlying_is_eof_or_malformed, because we assume that
+    # the underlying IO can un-eof itself, and also because this is also set when
+    # underlying is malformed, which does not indicate EOF.
+
     # No data immediately available
-    io.buffer_pos > io.buffer_filled || return false
+    io.consumed ≥ io.filled || return false
 
     # No data waiting to be moved to the buffer
     isempty(io.result_queue) || return false
@@ -322,15 +357,15 @@ function BufferIO.fill_buffer(io::BGZFReader)
     io.state == STATE_ERROR && throw(BGZFError(nothing, BGZFErrors.operation_on_error))
 
     # Check if block has data already, we can't expand it. Return nothing.
-    io.buffer_pos > io.buffer_filled || return nothing
+    io.consumed ≥ io.filled || return nothing
 
     # Reuse buffer, except if it's the dummy buffer (which it is initialized with),
     # or if we previously tried to fill the buffer but couldnt.
     if !isempty(io.buffer)
         push!(io.buffer_pool, io.buffer)
         io.buffer = DUMMY_BUFFER
-        io.buffer_filled = 0
-        io.buffer_pos = 1
+        io.filled = 0
+        io.consumed = 0
     end
 
     # Get results from workers, if any are ready. This allows us to 'move along'
@@ -343,9 +378,14 @@ function BufferIO.fill_buffer(io::BGZFReader)
         end
     end
 
+    # If we have work waiting, either in result queue or at workers.
+    have_work_waiting = !isempty(io.result_queue) || io.n_buffers_shipped_or_skipped > io.n_buffers_received_or_skipped
+
     # One package takes 2 * BLOCKS_PER_PACKAGE buffers. Queue all the packages we can,
     # i.e. until we run out of buffers or until the underlying io hits EOF
-    if length(io.buffer_pool) ≥ 2 * BLOCKS_PER_PACKAGE
+    if (length(io.buffer_pool) ≥ 2 * BLOCKS_PER_PACKAGE) &&
+            # Do not queue if underlying is EOF, except if we have no work waiting.
+            (!io.underlying_is_eof_or_malformed || !have_work_waiting)
         queue!(io)
     end
 
@@ -376,9 +416,7 @@ function BufferIO.fill_buffer(io::BGZFReader)
     # We just try this function again. This can't happen twice, because after the
     # loop above, we have all the buffers, and so can queue new work which cannot
     # be invalid.
-    if seen_invalidated
-        return fill_buffer(io)
-    end
+    seen_invalidated && fill_buffer(io)
 
     # No data in buffer, no workers were active, even after queuing all workers
     # until EOF. If we reach this point, we are EOF.
@@ -386,18 +424,46 @@ function BufferIO.fill_buffer(io::BGZFReader)
 end
 
 function queue!(io::BGZFReader)
+    error = nothing
+    seen_eof = false
     while length(io.buffer_pool) ≥ 2 * BLOCKS_PER_PACKAGE
-        fst = get_reader_block_work(io)
-        isnothing(fst) && return nothing
-        block_works = ReaderBlockWork[fst]
-        for _ in 1:(BLOCKS_PER_PACKAGE - 1)
-            block = @something get_reader_block_work(io) break
-            push!(block_works, block)
+        # TODO: Annoying that we allocate this here even if EOF.
+        block_works = ReaderBlockWork[]
+        for _ in 1:BLOCKS_PER_PACKAGE
+            block = get_reader_block_work(io)
+            if block === nothing
+                # no block indicated EOF.
+                @assert io.underlying_is_eof_or_malformed
+                seen_eof = true
+                break
+            elseif block isa BGZFError
+                @assert io.underlying_is_eof_or_malformed
+                error = block
+                break
+            else
+                io.underlying_is_eof_or_malformed = false
+                push!(block_works, block)
+            end
         end
-        package = ReaderWorkPackage(io.n_buffers_shipped_or_skipped, block_works)
-        io.n_buffers_shipped_or_skipped += length(block_works)
-        @assert !isfull(io.sender)
-        put!(io.sender, package)
+        # Even if we saw EOF or malformed, we still need to queue any well-formed
+        # blocks before.
+        if !isempty(block_works)
+            package = ReaderWorkPackage(io.n_buffers_shipped_or_skipped, block_works)
+            io.n_buffers_shipped_or_skipped += length(block_works)
+            put!(io.sender, package)
+        end
+        # If we see an error, we cannot queue it. Instead, we put the resulting error
+        # directly into the result queue at the correct position so the error is triggered
+        # when the block is trying to be read from.
+        if error !== nothing
+            queue_position = io.n_buffers_shipped_or_skipped - io.queue_n_removed_or_skipped + 1
+            for _ in length(io.result_queue):queue_position
+                push!(io.result_queue, nothing)
+            end
+            io.result_queue[queue_position] = error
+            return nothing
+        end
+        seen_eof && return nothing
     end
     return
 end
@@ -442,8 +508,8 @@ function take_buffer_if_some!(io::BGZFReader)::Union{Nothing, Int}
         (block_offset, buffer) = result
         io.current_block_offset = block_offset
         io.buffer = parent(buffer)
-        io.buffer_filled = last(only(parentindices(buffer)))
-        io.buffer_pos = 1
+        io.filled = last(only(parentindices(buffer)))
+        io.consumed = 0
         popfirst!(io.result_queue)
         io.queue_n_removed_or_skipped += 1
         length(buffer)
@@ -454,17 +520,22 @@ function take_buffer_if_some!(io::BGZFReader)::Union{Nothing, Int}
     end
 end
 
-# Read data from io.io to create work for a single block, or, if io.io is EOF,
-# return nothing
-function get_reader_block_work(io::BGZFReader)::Union{Nothing, ReaderBlockWork}
+# Read data from io.io to create work for a single block.
+# If EOF, return nothing.
+# If BGZF block is malformed, return the BGZFError.
+function get_reader_block_work(io::BGZFReader)::Union{Nothing, ReaderBlockWork, BGZFError}
     last_was_empty = io.check_truncated ? io.last_was_empty : nothing
     (; consumed, result) = get_reader_block_work(io.io, io.gzip_extra_fields, last_was_empty, io.n_bytes_read)
     io.n_bytes_read += consumed
     if result === nothing
         io.last_was_empty = true
-        return nothing
+        # Underlying IO is EOF
+        io.underlying_is_eof_or_malformed = true
+        return result
     elseif result isa BGZFError
-        throw_error(io, result)
+        # Underlying IO is malformed
+        io.underlying_is_eof_or_malformed = true
+        return result
     else
         io.last_was_empty = false
         source = MemoryView(pop!(io.buffer_pool))[1:length(result.payload)]
