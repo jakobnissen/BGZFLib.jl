@@ -38,6 +38,13 @@
         @test cmp(vo2, vo1) == 1
         @test cmp(vo1, vo4) == 0
     end
+
+    @testset "Show" begin
+        vo = VirtualOffset(2^48 - 1, 2^16 - 1)
+        io = IOBuffer()
+        show(io, vo)
+        @test !isempty(take!(io))
+    end
 end
 
 
